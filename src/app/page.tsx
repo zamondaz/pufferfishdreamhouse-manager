@@ -56,20 +56,29 @@ export default function PufferfishDashboardPage() {
     }, 3500);
   }, []);
 
-  const loadData = useCallback(async () => {
-    setLoading(true);
+  const loadData = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
     const data = await fetchGuesthouseData();
     setBeds(data.beds);
     setReservations(data.reservations);
     setStaff(data.staff);
-    setLoading(false);
+    if (!silent) setLoading(false);
   }, []);
 
   useEffect(() => {
     const now = new Date();
     setTodayDate(now);
     setStartDate(now);
-    loadData();
+    loadData(false);
+
+    const onFocus = () => loadData(true);
+    window.addEventListener('focus', onFocus);
+    const interval = window.setInterval(() => loadData(true), 15000);
+
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      window.clearInterval(interval);
+    };
   }, [loadData]);
 
   // 14-day window date strings

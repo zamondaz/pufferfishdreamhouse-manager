@@ -10,8 +10,13 @@ import {
   UpdateStaffProfilePayload,
 } from '@/types/guesthouse';
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim() || '';
-const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY?.trim() || '';
+const supabaseUrl =
+  process.env.NEXT_PUBLIC_SUPABASE_URL?.trim() ||
+  'https://gshhluefnarkenshgxzr.supabase.co';
+const supabaseAnonKey =
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY?.trim() ||
+  process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY?.trim() ||
+  'sb_publishable_gC96KQNbbAtQ_QG0zO2f9A_vZ7Mim_g';
 
 export const isSupabaseConfigured = Boolean(
   supabaseUrl &&

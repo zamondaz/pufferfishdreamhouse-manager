@@ -13,9 +13,9 @@ import {
   fetchGuesthouseData,
   formatBedCode,
   INITIAL_BEDS,
-  resetMockState,
   updateReservation,
   updateStaffLocation,
+  updateStaffProfile,
 } from '@/lib/supabase';
 import {
   Bed,
@@ -24,6 +24,7 @@ import {
   Staff,
   StaffLocationNote,
   UpdateReservationPayload,
+  UpdateStaffProfilePayload,
 } from '@/types/guesthouse';
 
 const FALLBACK_DATE = new Date(2026, 9, 27);
@@ -36,7 +37,6 @@ export default function PufferfishDashboardPage() {
   const [beds, setBeds] = useState<Bed[]>(INITIAL_BEDS);
   const [reservations, setReservations] = useState<Reservation[]>([]);
   const [staff, setStaff] = useState<Staff[]>([]);
-  const [usingMock, setUsingMock] = useState<boolean>(true);
   const [loading, setLoading] = useState<boolean>(true);
   const [updatingStaffId, setUpdatingStaffId] = useState<string | null>(null);
 
@@ -62,7 +62,6 @@ export default function PufferfishDashboardPage() {
     setBeds(data.beds);
     setReservations(data.reservations);
     setStaff(data.staff);
-    setUsingMock(data.usingMock);
     setLoading(false);
   }, []);
 
@@ -172,13 +171,18 @@ export default function PufferfishDashboardPage() {
     }
   };
 
-  const handleResetMock = () => {
-    const fresh = resetMockState();
-    setBeds(fresh.beds);
-    setReservations(fresh.reservations);
-    setStaff(fresh.staff);
-    setStartDate(new Date());
-    showToast('🔄 데모 데이터가 초기 상태로 복원되었습니다.');
+  const handleUpdateStaffProfile = async (
+    payload: UpdateStaffProfilePayload
+  ) => {
+    const updated = await updateStaffProfile(payload);
+    if (updated) {
+      setStaff((prev) =>
+        prev.map((s) => (s.id === payload.id ? updated : s))
+      );
+      showToast(
+        `👤 스태프 프로필이 '${updated.name} (${updated.gender === 'M' ? '남' : '여'})'(으)로 변경되었습니다.`
+      );
+    }
   };
 
   return (
@@ -196,10 +200,8 @@ export default function PufferfishDashboardPage() {
         beds={beds}
         reservations={reservations}
         staff={staff}
-        usingMock={usingMock}
         totalConflictCount={totalConflictCount}
         onOpenNewReservation={handleOpenNewReservation}
-        onResetMock={handleResetMock}
       />
 
       {/* Main Content */}
@@ -244,6 +246,7 @@ export default function PufferfishDashboardPage() {
               dateStrings={dateStrings}
               updatingStaffId={updatingStaffId}
               onChangeStaffLocation={handleChangeStaffLocation}
+              onUpdateStaffProfile={handleUpdateStaffProfile}
             />
           </>
         )}

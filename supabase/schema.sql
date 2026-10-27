@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS staff (
   check_in DATE NOT NULL,
   check_out DATE NOT NULL,
   current_bed_id INT NULL REFERENCES beds(id) ON DELETE SET NULL,
-  location_note VARCHAR(20) NOT NULL DEFAULT '침대' CHECK (location_note IN ('침대', '거실', '사장님방', '외부'))
+  location_note VARCHAR(20) NOT NULL DEFAULT '침대' CHECK (location_note IN ('침대', '거실', '사장님방', '샤바나', '외박'))
 );
 
 -- Disable RLS on all 3 tables (solo guesthouse owner app)

@@ -5,11 +5,10 @@ import {
   AlertTriangle,
   BedDouble,
   CalendarPlus,
-  Database,
-  RotateCcw,
   ShieldCheck,
   Users,
 } from 'lucide-react';
+import { isStaffSleepingInside } from '@/lib/supabase';
 import { Bed, Reservation, Staff } from '@/types/guesthouse';
 
 interface HeaderSummaryProps {
@@ -17,10 +16,8 @@ interface HeaderSummaryProps {
   beds: Bed[];
   reservations: Reservation[];
   staff: Staff[];
-  usingMock: boolean;
   totalConflictCount: number;
   onOpenNewReservation: () => void;
-  onResetMock: () => void;
 }
 
 export default function HeaderSummary({
@@ -28,10 +25,8 @@ export default function HeaderSummary({
   beds,
   reservations,
   staff,
-  usingMock,
   totalConflictCount,
   onOpenNewReservation,
-  onResetMock,
 }: HeaderSummaryProps) {
   // Guests sleeping tonight: check_in <= todayStr < check_out
   const tonightGuests = reservations.filter(
@@ -43,9 +38,13 @@ export default function HeaderSummary({
     (s) => s.check_in <= todayStr && todayStr < s.check_out
   );
 
-  // Staff sleeping inside the guesthouse tonight (침대, 거실, 사장님방 — excluding '외부')
-  const tonightStaffInside = activeStaffToday.filter((s) => s.location_note !== '외부');
-  const tonightStaffOutside = activeStaffToday.filter((s) => s.location_note === '외부');
+  // Staff sleeping inside the guesthouse tonight (침대, 거실, 사장님방, 샤바나 — excluding '외박')
+  const tonightStaffInside = activeStaffToday.filter((s) =>
+    isStaffSleepingInside(s.location_note)
+  );
+  const tonightStaffOutside = activeStaffToday.filter(
+    (s) => !isStaffSleepingInside(s.location_note)
+  );
 
   const totalHeadcountTonight = tonightGuests.length + tonightStaffInside.length;
 
@@ -75,16 +74,6 @@ export default function HeaderSummary({
                 <h1 className="text-xl sm:text-2xl font-extrabold text-slate-900 tracking-tight">
                   Pufferfish Manager 🐡
                 </h1>
-                <span
-                  className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold ${
-                    usingMock
-                      ? 'bg-amber-50 text-amber-800 border border-amber-200'
-                      : 'bg-emerald-50 text-emerald-800 border border-emerald-200'
-                  }`}
-                >
-                  <Database className="w-3.5 h-3.5" />
-                  {usingMock ? '로컬 데모 모드 (Mock Data)' : 'Supabase 실시간 연동'}
-                </span>
               </div>
               <p className="text-xs sm:text-sm text-slate-500 mt-0.5">
                 1인 사장님 맞춤형 게스트하우스 베드맵 &amp; 상주 스태프 침대 관리 시스템
@@ -93,17 +82,6 @@ export default function HeaderSummary({
           </div>
 
           <div className="flex items-center gap-2.5 self-start md:self-auto">
-            {usingMock && (
-              <button
-                type="button"
-                onClick={onResetMock}
-                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium text-slate-600 bg-slate-100 hover:bg-slate-200 transition-colors cursor-pointer"
-                title="데모 데이터를 초기 상태로 되돌립니다"
-              >
-                <RotateCcw className="w-3.5 h-3.5" />
-                데모 초기화
-              </button>
-            )}
             <button
               type="button"
               onClick={onOpenNewReservation}
@@ -183,7 +161,7 @@ export default function HeaderSummary({
               <p className="text-[11px] text-slate-500 mt-1">
                 스태프 내부 취침 {tonightStaffInside.length}명
                 {tonightStaffOutside.length > 0
-                  ? ` · 외부 취침 ${tonightStaffOutside.length}명 (인원 제외)`
+                  ? ` · 외박 ${tonightStaffOutside.length}명 (인원 제외)`
                   : ''}
               </p>
             </div>
@@ -215,7 +193,7 @@ export default function HeaderSummary({
               </div>
               <p className="text-[11px] mt-1 opacity-80">
                 {totalConflictCount > 0
-                  ? '아래 스태프 컨트롤러에서 빈 침대나 거실/사장님방으로 변경하세요.'
+                  ? '아래 스태프 컨트롤러에서 빈 침대나 거실/사장님방/샤바나로 변경하세요.'
                   : '표시된 14일 일정 내 게스트-스태프 침대 충돌이 없습니다.'}
               </p>
             </div>

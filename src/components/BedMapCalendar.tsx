@@ -19,6 +19,7 @@ import {
   formatBedCode,
   generateGroupCode,
   getBedMaxCapacity,
+  isStaffSleepingInside,
 } from '@/lib/supabase';
 import {
   Bed,
@@ -236,7 +237,7 @@ export default function BedMapCalendar({
         (s) =>
           s.check_in <= d.dateStr &&
           d.dateStr < s.check_out &&
-          s.location_note !== '외부'
+          isStaffSleepingInside(s.location_note)
       ).length;
       return {
         guestCount: gCount,

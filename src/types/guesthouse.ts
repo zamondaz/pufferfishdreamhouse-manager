@@ -2,7 +2,7 @@ export type Gender = 'M' | 'F';
 
 export type RoomName = '5인실' | '4인실' | '2인실' | '1인실';
 
-export type StaffLocationNote = '침대' | '거실' | '사장님방' | '외부';
+export type StaffLocationNote = '침대' | '거실' | '사장님방' | '샤바나' | '외박';
 
 export interface Bed {
   id: number;
@@ -29,6 +29,14 @@ export interface Staff {
   check_out: string; // YYYY-MM-DD
   current_bed_id: number | null;
   location_note: StaffLocationNote;
+}
+
+export interface UpdateStaffProfilePayload {
+  id: string;
+  name: string;
+  gender: Gender;
+  check_in?: string;
+  check_out?: string;
 }
 
 export interface NewReservationGuestInput {

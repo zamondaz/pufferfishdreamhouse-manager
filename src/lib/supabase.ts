@@ -7,6 +7,7 @@ import {
   Staff,
   StaffLocationNote,
   UpdateReservationPayload,
+  UpdateStaffProfilePayload,
 } from '@/types/guesthouse';
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim() || '';
@@ -214,7 +215,12 @@ function loadMockState(): { beds: Bed[]; reservations: Reservation[]; staff: Sta
     const reservations: Reservation[] = savedRes
       ? JSON.parse(savedRes)
       : getInitialMockReservations();
-    const staff: Staff[] = savedStaff ? JSON.parse(savedStaff) : getInitialMockStaff();
+    const rawStaff: Staff[] = savedStaff ? JSON.parse(savedStaff) : getInitialMockStaff();
+    const staff: Staff[] = rawStaff.map((s) => ({
+      ...s,
+      location_note:
+        (s.location_note as string) === '외부' ? '외박' : s.location_note,
+    }));
 
     if (!savedRes) {
       window.localStorage.setItem(STORAGE_KEYS.RESERVATIONS, JSON.stringify(reservations));
@@ -458,6 +464,62 @@ export async function updateStaffLocation(
     window.localStorage.setItem(STORAGE_KEYS.STAFF, JSON.stringify(updatedStaffList));
   }
   return updatedStaffMember;
+}
+
+export async function updateStaffProfile(
+  payload: UpdateStaffProfilePayload
+): Promise<Staff | null> {
+  const patch: Record<string, unknown> = {
+    name: payload.name.trim(),
+    gender: payload.gender,
+  };
+  if (payload.check_in) patch.check_in = payload.check_in;
+  if (payload.check_out) patch.check_out = payload.check_out;
+
+  if (supabase) {
+    const { data, error } = await supabase
+      .from('staff')
+      .update(patch)
+      .eq('id', payload.id)
+      .select('*')
+      .single();
+
+    if (!error && data) {
+      return data as Staff;
+    }
+  }
+
+  const mock = loadMockState();
+  let updatedStaffMember: Staff | null = null;
+  const updatedStaffList = mock.staff.map((s) => {
+    if (s.id === payload.id) {
+      updatedStaffMember = {
+        ...s,
+        name: payload.name.trim(),
+        gender: payload.gender,
+        check_in: payload.check_in || s.check_in,
+        check_out: payload.check_out || s.check_out,
+      };
+      return updatedStaffMember;
+    }
+    return s;
+  });
+
+  if (typeof window !== 'undefined') {
+    window.localStorage.setItem(
+      STORAGE_KEYS.STAFF,
+      JSON.stringify(updatedStaffList)
+    );
+  }
+  return updatedStaffMember;
+}
+
+/**
+ * Returns true if the staff member is sleeping inside the guesthouse
+ * ('침대', '거실', '사장님방', '샤바나' -> true; '외박' -> false)
+ */
+export function isStaffSleepingInside(locationNote: string): boolean {
+  return locationNote !== '외박' && locationNote !== '외부';
 }
 
 /**

@@ -6,15 +6,27 @@ import { ko } from 'date-fns/locale';
 import {
   AlertTriangle,
   Calendar as CalendarIcon,
+  Check,
   ChevronLeft,
   ChevronRight,
+  Pencil,
   Plus,
   Trash2,
   Users,
   X,
 } from 'lucide-react';
-import { formatBedCode, getBedMaxCapacity } from '@/lib/supabase';
-import { Bed, Reservation, Staff } from '@/types/guesthouse';
+import {
+  formatBedCode,
+  generateGroupCode,
+  getBedMaxCapacity,
+} from '@/lib/supabase';
+import {
+  Bed,
+  Gender,
+  Reservation,
+  Staff,
+  UpdateReservationPayload,
+} from '@/types/guesthouse';
 
 interface BedMapCalendarProps {
   beds: Bed[];
@@ -24,6 +36,7 @@ interface BedMapCalendarProps {
   startDate: Date;
   onChangeStartDate: (newDate: Date) => void;
   onClickEmptyCell: (bedId: number, dateStr: string) => void;
+  onUpdateReservation: (payload: UpdateReservationPayload) => Promise<void>;
   onDeleteReservation: (reservationId: string) => void;
 }
 
@@ -102,11 +115,35 @@ export default function BedMapCalendar({
   startDate,
   onChangeStartDate,
   onClickEmptyCell,
+  onUpdateReservation,
   onDeleteReservation,
 }: BedMapCalendarProps) {
   const [hoveredGroupCode, setHoveredGroupCode] = useState<string | null>(null);
   const [selectedReservation, setSelectedReservation] =
     useState<Reservation | null>(null);
+
+  // Edit form states inside the Reservation Detail/Edit Modal
+  const [editGuestName, setEditGuestName] = useState<string>('');
+  const [editGender, setEditGender] = useState<Gender>('M');
+  const [editBedId, setEditBedId] = useState<number>(1);
+  const [editCheckIn, setEditCheckIn] = useState<string>('');
+  const [editCheckOut, setEditCheckOut] = useState<string>('');
+  const [editGroupCode, setEditGroupCode] = useState<string>('');
+  const [syncGroupDates, setSyncGroupDates] = useState<boolean>(true);
+  const [editError, setEditError] = useState<string | null>(null);
+  const [savingEdit, setSavingEdit] = useState<boolean>(false);
+
+  const openReservationEditor = (res: Reservation) => {
+    setSelectedReservation(res);
+    setEditGuestName(res.guest_name);
+    setEditGender(res.gender);
+    setEditBedId(res.bed_id);
+    setEditCheckIn(res.check_in);
+    setEditCheckOut(res.check_out);
+    setEditGroupCode(res.group_code || '');
+    setSyncGroupDates(Boolean(res.group_code));
+    setEditError(null);
+  };
 
   // Build 14 days array starting from startDate
   const days = useMemo(() => {
@@ -474,7 +511,7 @@ export default function BedMapCalendar({
                                 setHoveredGroupCode(primaryGuest.group_code)
                               }
                               onMouseLeave={() => setHoveredGroupCode(null)}
-                              onClick={() => setSelectedReservation(primaryGuest)}
+                              onClick={() => openReservationEditor(primaryGuest)}
                               className={`p-1 border-r border-slate-200 align-top cursor-pointer transition-all ${
                                 isConflict
                                   ? 'bg-amber-50/60'
@@ -505,7 +542,7 @@ export default function BedMapCalendar({
                                       key={g.id}
                                       onClick={(e) => {
                                         e.stopPropagation();
-                                        setSelectedReservation(g);
+                                        openReservationEditor(g);
                                       }}
                                       className="flex items-center justify-between gap-1 hover:opacity-80"
                                     >
@@ -673,112 +710,363 @@ export default function BedMapCalendar({
         </div>
       </div>
 
-      {/* Selected Reservation Detail / Delete Popover Modal */}
+      {/* Selected Reservation Detail / Edit / Delete Modal */}
       {selectedReservation && (
         <div
-          className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4"
+          className="fixed inset-0 z-50 bg-slate-900/55 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto"
           onClick={() => setSelectedReservation(null)}
         >
           <div
-            className="bg-white rounded-2xl border border-slate-200 shadow-xl max-w-md w-full p-5"
+            className="bg-white rounded-2xl border border-slate-200 shadow-2xl max-w-lg w-full overflow-hidden my-8"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+            <div className="px-5 py-4 bg-slate-900 text-white flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <span className="text-lg font-extrabold text-slate-900">
-                  {selectedReservation.guest_name}
-                </span>
-                <span
-                  className={`px-2 py-0.5 rounded text-xs font-bold ${
-                    selectedReservation.gender === 'M'
-                      ? 'bg-sky-100 text-sky-800'
-                      : 'bg-rose-100 text-rose-800'
-                  }`}
-                >
-                  {selectedReservation.gender === 'M' ? '남성 (M)' : '여성 (F)'}
+                <Pencil className="w-4 h-4 text-indigo-300" />
+                <span className="text-base font-extrabold">
+                  예약 상세 조회 및 수정
                 </span>
               </div>
               <button
                 type="button"
                 onClick={() => setSelectedReservation(null)}
-                className="p-1 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 cursor-pointer"
+                className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
 
-            <div className="py-4 space-y-2.5 text-sm">
-              <div className="flex justify-between">
-                <span className="text-slate-500">배정 침대</span>
-                <span className="font-bold text-slate-900">
-                  {(() => {
-                    const b = beds.find((x) => x.id === selectedReservation.bed_id);
-                    return b ? `${formatBedCode(b)} (${b.room_name})` : `#${selectedReservation.bed_id}`;
-                  })()}
-                </span>
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                setEditError(null);
+
+                if (!editGuestName.trim()) {
+                  setEditError('투숙객 이름을 입력해 주세요.');
+                  return;
+                }
+                if (!editCheckIn || !editCheckOut || editCheckOut <= editCheckIn) {
+                  setEditError('체크아웃 날짜는 체크인 날짜보다 이후여야 합니다.');
+                  return;
+                }
+
+                // Check bed capacity against other reservations overlapping [editCheckIn, editCheckOut)
+                const targetBedObj = beds.find((b) => b.id === Number(editBedId));
+                const maxCap = targetBedObj ? getBedMaxCapacity(targetBedObj) : 1;
+                const overlappingOthers = reservations.filter(
+                  (r) =>
+                    r.id !== selectedReservation.id &&
+                    r.bed_id === Number(editBedId) &&
+                    r.check_in < editCheckOut &&
+                    r.check_out > editCheckIn
+                );
+
+                if (overlappingOthers.length >= maxCap) {
+                  const bedLabel = targetBedObj
+                    ? formatBedCode(targetBedObj)
+                    : `#${editBedId}`;
+                  setEditError(
+                    `${bedLabel} 침대는 선택한 일정에 이미 예약(${overlappingOthers
+                      .map((o) => o.guest_name)
+                      .join(', ')})이 차 있습니다.`
+                  );
+                  return;
+                }
+
+                try {
+                  setSavingEdit(true);
+                  await onUpdateReservation({
+                    id: selectedReservation.id,
+                    guest_name: editGuestName.trim(),
+                    gender: editGender,
+                    bed_id: Number(editBedId),
+                    check_in: editCheckIn,
+                    check_out: editCheckOut,
+                    group_code: editGroupCode.trim() || null,
+                    syncGroupDates:
+                      syncGroupDates && Boolean(selectedReservation.group_code),
+                    originalGroupCode: selectedReservation.group_code,
+                  });
+                  setSelectedReservation(null);
+                } catch {
+                  setEditError('예약 수정 중 오류가 발생했습니다.');
+                } finally {
+                  setSavingEdit(false);
+                }
+              }}
+              className="p-5 space-y-4 text-sm"
+            >
+              {/* Name & Gender */}
+              <div className="grid grid-cols-1 sm:grid-cols-12 gap-3">
+                <div className="sm:col-span-7">
+                  <label className="block text-xs font-bold text-slate-700 mb-1">
+                    투숙객 이름
+                  </label>
+                  <input
+                    type="text"
+                    value={editGuestName}
+                    onChange={(e) => setEditGuestName(e.target.value)}
+                    className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm font-bold text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    required
+                  />
+                </div>
+                <div className="sm:col-span-5">
+                  <label className="block text-xs font-bold text-slate-700 mb-1">
+                    성별
+                  </label>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {(['M', 'F'] as Gender[]).map((gKey) => (
+                      <button
+                        key={gKey}
+                        type="button"
+                        onClick={() => setEditGender(gKey)}
+                        className={`py-2 rounded-xl text-xs font-bold border transition-all cursor-pointer ${
+                          editGender === gKey
+                            ? gKey === 'M'
+                              ? 'bg-sky-600 text-white border-sky-600'
+                              : 'bg-rose-600 text-white border-rose-600'
+                            : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'
+                        }`}
+                      >
+                        {gKey === 'M' ? '남 (M)' : '여 (F)'}
+                      </button>
+                    ))}
+                  </div>
+                </div>
               </div>
-              <div className="flex justify-between">
-                <span className="text-slate-500">체크인 ~ 체크아웃</span>
-                <span className="font-bold text-slate-900">
-                  {selectedReservation.check_in} ~ {selectedReservation.check_out}
-                </span>
+
+              {/* Bed Selection */}
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1">
+                  배정 침대 변경
+                </label>
+                <select
+                  value={editBedId}
+                  onChange={(e) => setEditBedId(Number(e.target.value))}
+                  className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-bold text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                >
+                  {beds.map((b) => {
+                    const maxCap = getBedMaxCapacity(b);
+                    const otherGuests = reservations.filter(
+                      (r) =>
+                        r.id !== selectedReservation.id &&
+                        r.bed_id === b.id &&
+                        r.check_in < editCheckOut &&
+                        r.check_out > editCheckIn
+                    );
+                    const isFull = otherGuests.length >= maxCap;
+                    const staffOnBed = staff.find(
+                      (s) =>
+                        s.current_bed_id === b.id &&
+                        s.check_in < editCheckOut &&
+                        s.check_out > editCheckIn
+                    );
+
+                    let suffix = ' (이동 가능)';
+                    if (b.id === selectedReservation.bed_id) {
+                      suffix = ' (현재 배정 침대)';
+                    } else if (isFull) {
+                      suffix = ` (❌ ${otherGuests
+                        .map((o) => o.guest_name)
+                        .join(', ')} 투숙 중)`;
+                    } else if (otherGuests.length > 0) {
+                      suffix = ` (👫 ${otherGuests[0].guest_name} 외 1인 동반 가능)`;
+                    } else if (staffOnBed) {
+                      suffix = ` (⚠️ ${staffOnBed.name} 배정 침대)`;
+                    }
+
+                    return (
+                      <option key={b.id} value={b.id} disabled={isFull}>
+                        {formatBedCode(b)} ({b.room_name}
+                        {maxCap > 1 ? '·최대2인' : ''}){suffix}
+                      </option>
+                    );
+                  })}
+                </select>
               </div>
-              <div className="flex justify-between items-center">
-                <span className="text-slate-500">일행 그룹 코드</span>
-                {selectedReservation.group_code ? (
-                  <span className="px-2.5 py-0.5 rounded-full bg-indigo-100 text-indigo-800 font-bold text-xs">
-                    👥 {selectedReservation.group_code}
-                  </span>
-                ) : (
-                  <span className="text-slate-400 text-xs">개인 예약 (없음)</span>
+
+              {/* Check-in / Check-out Dates */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 bg-slate-50 p-3.5 rounded-xl border border-slate-200">
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-1">
+                    체크인 (Check-In)
+                  </label>
+                  <input
+                    type="date"
+                    value={editCheckIn}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setEditCheckIn(val);
+                      if (val && editCheckOut <= val) {
+                        setEditCheckOut(
+                          format(addDays(parseISO(val), 1), 'yyyy-MM-dd')
+                        );
+                      }
+                    }}
+                    className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-bold text-slate-900"
+                    required
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-1">
+                    체크아웃 (Check-Out)
+                  </label>
+                  <input
+                    type="date"
+                    value={editCheckOut}
+                    min={
+                      editCheckIn
+                        ? format(addDays(parseISO(editCheckIn), 1), 'yyyy-MM-dd')
+                        : undefined
+                    }
+                    onChange={(e) => setEditCheckOut(e.target.value)}
+                    className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-bold text-slate-900"
+                    required
+                  />
+                </div>
+
+                {selectedReservation.group_code && (
+                  <label className="sm:col-span-2 flex items-center gap-2 pt-1 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={syncGroupDates}
+                      onChange={(e) => setSyncGroupDates(e.target.checked)}
+                      className="rounded text-indigo-600 focus:ring-indigo-500"
+                    />
+                    <span className="text-xs font-bold text-indigo-900">
+                      같은 일행({selectedReservation.group_code}) 전체의 체크인·체크아웃 날짜도 함께 변경
+                    </span>
+                  </label>
                 )}
               </div>
 
-              {selectedReservation.group_code && (
-                <div className="mt-3 p-3 rounded-xl bg-slate-50 border border-slate-200">
-                  <div className="text-xs font-bold text-slate-600 mb-1.5">
-                    함께 투숙하는 일행 목록:
-                  </div>
-                  <div className="flex flex-wrap gap-1.5">
-                    {reservations
-                      .filter((r) => r.group_code === selectedReservation.group_code)
-                      .map((companion) => {
-                        const cb = beds.find((x) => x.id === companion.bed_id);
-                        return (
-                          <span
-                            key={companion.id}
-                            className="px-2 py-1 rounded-lg bg-white border border-slate-200 text-xs font-medium text-slate-800"
-                          >
-                            {companion.guest_name} ({companion.gender === 'M' ? '남' : '여'} ·{' '}
-                            {cb ? formatBedCode(cb) : ''})
-                          </span>
-                        );
-                      })}
+              {/* Group Code Edit & Companions List */}
+              <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <label className="text-xs font-bold text-slate-700">
+                    일행 그룹 코드 (같은 코드끼리 같은 색상으로 묶임)
+                  </label>
+                  <div className="flex items-center gap-1">
+                    {!editGroupCode && (
+                      <button
+                        type="button"
+                        onClick={() => setEditGroupCode(generateGroupCode())}
+                        className="px-2 py-0.5 rounded bg-indigo-100 hover:bg-indigo-200 text-indigo-700 text-[11px] font-bold cursor-pointer"
+                      >
+                        + 새 그룹코드 생성
+                      </button>
+                    )}
+                    {editGroupCode && (
+                      <button
+                        type="button"
+                        onClick={() => setEditGroupCode('')}
+                        className="px-2 py-0.5 rounded bg-slate-200 hover:bg-slate-300 text-slate-700 text-[11px] font-bold cursor-pointer"
+                      >
+                        개인으로 분리
+                      </button>
+                    )}
                   </div>
                 </div>
-              )}
-            </div>
 
-            <div className="pt-3 border-t border-slate-100 flex items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => {
-                  onDeleteReservation(selectedReservation.id);
-                  setSelectedReservation(null);
-                }}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold text-rose-700 bg-rose-50 hover:bg-rose-100 transition-colors cursor-pointer"
-              >
-                <Trash2 className="w-4 h-4" />
-                예약 취소/삭제
-              </button>
-              <button
-                type="button"
-                onClick={() => setSelectedReservation(null)}
-                className="px-4 py-2 rounded-xl text-xs font-bold text-slate-700 bg-slate-100 hover:bg-slate-200 transition-colors cursor-pointer"
-              >
-                닫기
-              </button>
-            </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    placeholder="개인 투숙 (그룹코드 없음)"
+                    value={editGroupCode}
+                    onChange={(e) => setEditGroupCode(e.target.value)}
+                    className="flex-1 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-bold text-slate-900"
+                  />
+                  {visibleGroups.length > 0 && (
+                    <select
+                      value=""
+                      onChange={(e) => {
+                        if (e.target.value) setEditGroupCode(e.target.value);
+                      }}
+                      className="rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-xs font-semibold text-slate-700"
+                    >
+                      <option value="">기존 일행에 합류...</option>
+                      {visibleGroups.map(([code, names]) => (
+                        <option key={code} value={code}>
+                          {code} ({names.join(', ')})
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                </div>
+
+                {selectedReservation.group_code && (
+                  <div className="pt-1">
+                    <div className="text-[11px] font-bold text-slate-500 mb-1">
+                      현재 함께 묶인 일행 목록 (클릭 시 해당 인원 수정):
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {reservations
+                        .filter(
+                          (r) => r.group_code === selectedReservation.group_code
+                        )
+                        .map((companion) => {
+                          const cb = beds.find((x) => x.id === companion.bed_id);
+                          const isSelf = companion.id === selectedReservation.id;
+                          return (
+                            <button
+                              key={companion.id}
+                              type="button"
+                              onClick={() => openReservationEditor(companion)}
+                              className={`px-2.5 py-1 rounded-lg border text-xs font-bold transition-colors cursor-pointer ${
+                                isSelf
+                                  ? 'bg-indigo-600 text-white border-indigo-600'
+                                  : 'bg-white hover:bg-indigo-50 border-slate-200 text-slate-800'
+                              }`}
+                            >
+                              {companion.guest_name} (
+                              {companion.gender === 'M' ? '남' : '여'} ·{' '}
+                              {cb ? formatBedCode(cb) : ''})
+                            </button>
+                          );
+                        })}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {editError && (
+                <div className="p-2.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs font-bold">
+                  {editError}
+                </div>
+              )}
+
+              <div className="pt-3 border-t border-slate-200 flex items-center justify-between gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    onDeleteReservation(selectedReservation.id);
+                    setSelectedReservation(null);
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl text-xs font-bold text-rose-700 bg-rose-50 hover:bg-rose-100 transition-colors cursor-pointer"
+                >
+                  <Trash2 className="w-4 h-4" />
+                  예약 취소/삭제
+                </button>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setSelectedReservation(null)}
+                    className="px-4 py-2.5 rounded-xl text-xs font-bold text-slate-700 bg-slate-100 hover:bg-slate-200 transition-colors cursor-pointer"
+                  >
+                    닫기
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={savingEdit}
+                    className="inline-flex items-center gap-1.5 px-5 py-2.5 rounded-xl text-xs font-extrabold text-white bg-indigo-600 hover:bg-indigo-700 shadow-xs transition-all cursor-pointer disabled:opacity-50"
+                  >
+                    <Check className="w-4 h-4" />
+                    {savingEdit ? '저장 중...' : '수정사항 저장'}
+                  </button>
+                </div>
+              </div>
+            </form>
           </div>
         </div>
       )}

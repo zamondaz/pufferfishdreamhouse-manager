@@ -42,3 +42,15 @@ export interface CreateReservationsPayload {
   check_out: string;
   guests: NewReservationGuestInput[];
 }
+
+export interface UpdateReservationPayload {
+  id: string;
+  guest_name: string;
+  gender: Gender;
+  bed_id: number;
+  check_in: string;
+  check_out: string;
+  group_code: string | null;
+  syncGroupDates?: boolean;
+  originalGroupCode?: string | null;
+}

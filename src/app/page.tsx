@@ -14,6 +14,7 @@ import {
   formatBedCode,
   INITIAL_BEDS,
   resetMockState,
+  updateReservation,
   updateStaffLocation,
 } from '@/lib/supabase';
 import {
@@ -22,6 +23,7 @@ import {
   Reservation,
   Staff,
   StaffLocationNote,
+  UpdateReservationPayload,
 } from '@/types/guesthouse';
 
 const FALLBACK_DATE = new Date(2026, 9, 27);
@@ -125,6 +127,18 @@ export default function PufferfishDashboardPage() {
     }
   };
 
+  const handleUpdateReservation = async (
+    payload: UpdateReservationPayload
+  ) => {
+    const updatedList = await updateReservation(payload);
+    setReservations(updatedList);
+    const bedObj = beds.find((b) => b.id === Number(payload.bed_id));
+    const bedLabel = bedObj ? formatBedCode(bedObj) : `#${payload.bed_id}`;
+    showToast(
+      `✏️ '${payload.guest_name}' 예약이 수정되었습니다. (${bedLabel} · ${payload.check_in}~${payload.check_out})`
+    );
+  };
+
   const handleDeleteReservation = async (reservationId: string) => {
     const target = reservations.find((r) => r.id === reservationId);
     await deleteReservation(reservationId);
@@ -217,6 +231,7 @@ export default function PufferfishDashboardPage() {
               startDate={startDate}
               onChangeStartDate={setStartDate}
               onClickEmptyCell={handleClickEmptyCell}
+              onUpdateReservation={handleUpdateReservation}
               onDeleteReservation={handleDeleteReservation}
             />
 

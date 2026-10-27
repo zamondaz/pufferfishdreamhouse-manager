@@ -6,6 +6,7 @@ import {
   Reservation,
   Staff,
   StaffLocationNote,
+  UpdateReservationPayload,
 } from '@/types/guesthouse';
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim() || '';
@@ -338,6 +339,82 @@ export async function deleteReservation(reservationId: string): Promise<void> {
   if (typeof window !== 'undefined') {
     window.localStorage.setItem(STORAGE_KEYS.RESERVATIONS, JSON.stringify(updated));
   }
+}
+
+export async function updateReservation(
+  payload: UpdateReservationPayload
+): Promise<Reservation[]> {
+  const normalizedGroupCode = payload.group_code?.trim() || null;
+
+  if (supabase) {
+    await supabase
+      .from('reservations')
+      .update({
+        guest_name: payload.guest_name.trim(),
+        gender: payload.gender,
+        bed_id: Number(payload.bed_id),
+        check_in: payload.check_in,
+        check_out: payload.check_out,
+        group_code: normalizedGroupCode,
+      })
+      .eq('id', payload.id);
+
+    if (payload.syncGroupDates && payload.originalGroupCode) {
+      await supabase
+        .from('reservations')
+        .update({
+          check_in: payload.check_in,
+          check_out: payload.check_out,
+        })
+        .eq('group_code', payload.originalGroupCode)
+        .neq('id', payload.id);
+    }
+
+    const { data, error } = await supabase
+      .from('reservations')
+      .select('*')
+      .order('check_in', { ascending: true });
+
+    if (!error && data) {
+      return data as Reservation[];
+    }
+  }
+
+  // Fallback mock mode
+  const mock = loadMockState();
+  const updatedList = mock.reservations.map((r) => {
+    if (r.id === payload.id) {
+      return {
+        ...r,
+        guest_name: payload.guest_name.trim(),
+        gender: payload.gender,
+        bed_id: Number(payload.bed_id),
+        check_in: payload.check_in,
+        check_out: payload.check_out,
+        group_code: normalizedGroupCode,
+      };
+    }
+    if (
+      payload.syncGroupDates &&
+      payload.originalGroupCode &&
+      r.group_code === payload.originalGroupCode
+    ) {
+      return {
+        ...r,
+        check_in: payload.check_in,
+        check_out: payload.check_out,
+      };
+    }
+    return r;
+  });
+
+  if (typeof window !== 'undefined') {
+    window.localStorage.setItem(
+      STORAGE_KEYS.RESERVATIONS,
+      JSON.stringify(updatedList)
+    );
+  }
+  return updatedList;
 }
 
 export async function updateStaffLocation(

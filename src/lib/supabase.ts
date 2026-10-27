@@ -268,9 +268,40 @@ export async function fetchGuesthouseData(): Promise<{
       ]);
 
       if (!bedsRes.error && !reservationsRes.error && !staffRes.error && bedsRes.data?.length) {
+        let finalReservations = (reservationsRes.data || []) as Reservation[];
+
+        // Auto-migrate existing browser localStorage reservations if Supabase table is initially empty
+        if (finalReservations.length === 0 && typeof window !== 'undefined') {
+          const savedLocalRes = window.localStorage.getItem(STORAGE_KEYS.RESERVATIONS);
+          if (savedLocalRes) {
+            try {
+              const localList: Reservation[] = JSON.parse(savedLocalRes);
+              if (localList.length > 0) {
+                const rowsToMigrate = localList.map((r) => ({
+                  guest_name: r.guest_name,
+                  gender: r.gender,
+                  bed_id: Number(r.bed_id),
+                  check_in: r.check_in,
+                  check_out: r.check_out,
+                  group_code: r.group_code,
+                }));
+                const { data: migratedData, error: migErr } = await supabase
+                  .from('reservations')
+                  .insert(rowsToMigrate)
+                  .select('*');
+                if (!migErr && migratedData) {
+                  finalReservations = migratedData as Reservation[];
+                }
+              }
+            } catch {
+              // ignore migration parse error
+            }
+          }
+        }
+
         return {
           beds: bedsRes.data as Bed[],
-          reservations: (reservationsRes.data || []) as Reservation[],
+          reservations: finalReservations,
           staff: (staffRes.data || []) as Staff[],
           usingMock: false,
         };

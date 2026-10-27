@@ -3,6 +3,7 @@ import { addDays, format, subDays } from 'date-fns';
 import {
   Bed,
   CreateReservationsPayload,
+  CreateStaffPayload,
   Reservation,
   Staff,
   StaffLocationNote,
@@ -548,6 +549,61 @@ export async function updateStaffProfile(
     );
   }
   return updatedStaffMember;
+}
+
+export async function createStaff(
+  payload: CreateStaffPayload
+): Promise<Staff | null> {
+  const normalizedNote: StaffLocationNote =
+    payload.current_bed_id !== null ? '침대' : payload.location_note;
+
+  if (supabase) {
+    const { data, error } = await supabase
+      .from('staff')
+      .insert({
+        name: payload.name.trim(),
+        gender: payload.gender,
+        check_in: payload.check_in,
+        check_out: payload.check_out,
+        current_bed_id: payload.current_bed_id,
+        location_note: normalizedNote,
+      })
+      .select('*')
+      .single();
+
+    if (!error && data) {
+      return data as Staff;
+    }
+  }
+
+  const mock = loadMockState();
+  const created: Staff = {
+    id: `mock-staff-${Date.now()}`,
+    name: payload.name.trim(),
+    gender: payload.gender,
+    check_in: payload.check_in,
+    check_out: payload.check_out,
+    current_bed_id: payload.current_bed_id,
+    location_note: normalizedNote,
+  };
+  const updatedList = [...mock.staff, created];
+  if (typeof window !== 'undefined') {
+    window.localStorage.setItem(STORAGE_KEYS.STAFF, JSON.stringify(updatedList));
+  }
+  return created;
+}
+
+export async function deleteStaff(staffId: string): Promise<void> {
+  if (supabase) {
+    const { error } = await supabase.from('staff').delete().eq('id', staffId);
+    if (!error) return;
+  }
+
+  const mock = loadMockState();
+  const updatedList = mock.staff.filter((s) => s.id !== staffId);
+  if (typeof window !== 'undefined') {
+    window.localStorage.setItem(STORAGE_KEYS.STAFF, JSON.stringify(updatedList));
+  }
 }
 
 /**

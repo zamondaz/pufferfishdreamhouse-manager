@@ -35,10 +35,19 @@ CREATE TABLE IF NOT EXISTS staff (
   location_note VARCHAR(20) NOT NULL DEFAULT '침대' CHECK (location_note IN ('침대', '거실', '사장님방', '샤바나', '외박'))
 );
 
--- Disable RLS on all 3 tables (solo guesthouse owner app)
-ALTER TABLE beds DISABLE ROW LEVEL SECURITY;
-ALTER TABLE reservations DISABLE ROW LEVEL SECURITY;
-ALTER TABLE staff DISABLE ROW LEVEL SECURITY;
+-- Disable RLS on all 3 tables (solo guesthouse owner app) + permissive policies as backup
+ALTER TABLE public.beds DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.reservations DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.staff DISABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Allow all on beds" ON public.beds;
+CREATE POLICY "Allow all on beds" ON public.beds FOR ALL USING (true) WITH CHECK (true);
+
+DROP POLICY IF EXISTS "Allow all on reservations" ON public.reservations;
+CREATE POLICY "Allow all on reservations" ON public.reservations FOR ALL USING (true) WITH CHECK (true);
+
+DROP POLICY IF EXISTS "Allow all on staff" ON public.staff;
+CREATE POLICY "Allow all on staff" ON public.staff FOR ALL USING (true) WITH CHECK (true);
 
 -- Seed Data: 12 Beds
 -- 5인실 (Beds 1-5), 4인실 (Beds 1-4), 2인실 (Beds 1-2), 1인실 (Bed 1)

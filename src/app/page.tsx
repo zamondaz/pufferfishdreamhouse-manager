@@ -9,7 +9,9 @@ import BedMapCalendar from '@/components/BedMapCalendar';
 import ReservationModal from '@/components/ReservationModal';
 import {
   createReservations,
+  createStaff,
   deleteReservation,
+  deleteStaff,
   fetchGuesthouseData,
   formatBedCode,
   INITIAL_BEDS,
@@ -20,6 +22,7 @@ import {
 import {
   Bed,
   CreateReservationsPayload,
+  CreateStaffPayload,
   Reservation,
   Staff,
   StaffLocationNote,
@@ -194,6 +197,25 @@ export default function PufferfishDashboardPage() {
     }
   };
 
+  const handleCreateStaff = async (payload: CreateStaffPayload) => {
+    const created = await createStaff(payload);
+    if (created) {
+      setStaff((prev) => [...prev, created]);
+      showToast(
+        `➕ 새 스태프 '${created.name} (${created.gender === 'M' ? '남' : '여'})'님이 추가되었습니다.`
+      );
+    }
+  };
+
+  const handleDeleteStaff = async (staffId: string) => {
+    const target = staff.find((s) => s.id === staffId);
+    await deleteStaff(staffId);
+    setStaff((prev) => prev.filter((s) => s.id !== staffId));
+    if (target) {
+      showToast(`🗑️ 스태프 '${target.name}'님이 삭제되었습니다.`);
+    }
+  };
+
   return (
     <div className="min-h-screen flex flex-col bg-slate-100">
       {/* Toast Notification */}
@@ -256,6 +278,8 @@ export default function PufferfishDashboardPage() {
               updatingStaffId={updatingStaffId}
               onChangeStaffLocation={handleChangeStaffLocation}
               onUpdateStaffProfile={handleUpdateStaffProfile}
+              onCreateStaff={handleCreateStaff}
+              onDeleteStaff={handleDeleteStaff}
             />
           </>
         )}

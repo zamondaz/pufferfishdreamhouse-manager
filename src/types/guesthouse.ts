@@ -39,6 +39,15 @@ export interface UpdateStaffProfilePayload {
   check_out?: string;
 }
 
+export interface CreateStaffPayload {
+  name: string;
+  gender: Gender;
+  check_in: string;
+  check_out: string;
+  current_bed_id: number | null;
+  location_note: StaffLocationNote;
+}
+
 export interface NewReservationGuestInput {
   guest_name: string;
   gender: Gender;

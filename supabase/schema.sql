@@ -49,8 +49,8 @@ CREATE POLICY "Allow all on reservations" ON public.reservations FOR ALL USING (
 DROP POLICY IF EXISTS "Allow all on staff" ON public.staff;
 CREATE POLICY "Allow all on staff" ON public.staff FOR ALL USING (true) WITH CHECK (true);
 
--- Seed Data: 12 Beds
--- 5인실 (Beds 1-5), 4인실 (Beds 1-4), 2인실 (Beds 1-2), 1인실 (Bed 1)
+-- Seed Data: 13 Beds (including 샤바나)
+-- 5인실 (Beds 1-5), 4인실 (Beds 1-4), 2인실 (Beds 1-2), 1인실 (Bed 1), 샤바나 (Bed 1 - unlimited capacity)
 INSERT INTO beds (id, room_name, bed_number) VALUES
   (1, '5인실', 1),
   (2, '5인실', 2),
@@ -63,7 +63,8 @@ INSERT INTO beds (id, room_name, bed_number) VALUES
   (9, '4인실', 4),
   (10, '2인실', 1),
   (11, '2인실', 2),
-  (12, '1인실', 1)
+  (12, '1인실', 1),
+  (13, '샤바나', 1)
 ON CONFLICT (id) DO NOTHING;
 
 -- Reset serial sequence to max id

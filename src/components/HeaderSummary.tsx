@@ -8,7 +8,10 @@ import {
   ShieldCheck,
   Users,
 } from 'lucide-react';
-import { isStaffSleepingInside } from '@/lib/supabase';
+import {
+  getStaffAssignmentForDate,
+  isStaffSleepingInside,
+} from '@/lib/supabase';
 import { Bed, Reservation, Staff } from '@/types/guesthouse';
 
 interface HeaderSummaryProps {
@@ -33,32 +36,51 @@ export default function HeaderSummary({
     (r) => r.check_in <= todayStr && todayStr < r.check_out
   );
 
-  // Staff active today: check_in <= todayStr < check_out
-  const activeStaffToday = staff.filter(
-    (s) => s.check_in <= todayStr && todayStr < s.check_out
-  );
-
-  // Staff sleeping inside the guesthouse tonight (침대, 거실, 사장님방, 샤바나 — excluding '외박')
-  const tonightStaffInside = activeStaffToday.filter((s) =>
-    isStaffSleepingInside(s.location_note)
-  );
-  const tonightStaffOutside = activeStaffToday.filter(
-    (s) => !isStaffSleepingInside(s.location_note)
-  );
+  // Staff sleeping inside the guesthouse tonight (date-specific assignment aware)
+  const tonightStaffInside = staff.filter((s) => {
+    const assign = getStaffAssignmentForDate(s, todayStr);
+    return isStaffSleepingInside(assign.location_note);
+  });
+  const tonightStaffOutside = staff.filter((s) => {
+    const assign = getStaffAssignmentForDate(s, todayStr);
+    return !isStaffSleepingInside(assign.location_note);
+  });
 
   const totalHeadcountTonight = tonightGuests.length + tonightStaffInside.length;
 
   const maleGuestsTonight = tonightGuests.filter((g) => g.gender === 'M').length;
   const femaleGuestsTonight = tonightGuests.filter((g) => g.gender === 'F').length;
 
-  // Occupied beds tonight (unique beds used by guests or non-conflicted staff in bed)
+  const regularBeds = beds.filter((b) => b.room_name !== '샤바나');
+  const shabanaBed = beds.find((b) => b.room_name === '샤바나');
+
+  // Occupied regular beds tonight (unique regular beds 1-12 used by guests or staff)
   const occupiedBedIdsTonight = new Set<number>();
-  tonightGuests.forEach((g) => occupiedBedIdsTonight.add(g.bed_id));
-  tonightStaffInside.forEach((s) => {
-    if (s.current_bed_id !== null) {
-      occupiedBedIdsTonight.add(s.current_bed_id);
+  tonightGuests.forEach((g) => {
+    if (!shabanaBed || g.bed_id !== shabanaBed.id) {
+      occupiedBedIdsTonight.add(g.bed_id);
     }
   });
+  tonightStaffInside.forEach((s) => {
+    const assign = getStaffAssignmentForDate(s, todayStr);
+    if (
+      assign.bed_id !== null &&
+      (!shabanaBed || assign.bed_id !== shabanaBed.id) &&
+      assign.location_note === '침대'
+    ) {
+      occupiedBedIdsTonight.add(assign.bed_id);
+    }
+  });
+
+  const shabanaTonightCount =
+    tonightGuests.filter((g) => shabanaBed && g.bed_id === shabanaBed.id).length +
+    tonightStaffInside.filter((s) => {
+      const assign = getStaffAssignmentForDate(s, todayStr);
+      return (
+        assign.location_note === '샤바나' ||
+        (shabanaBed && assign.bed_id === shabanaBed.id)
+      );
+    }).length;
 
   return (
     <header className="bg-white border-b border-slate-200 shadow-xs">
@@ -152,16 +174,21 @@ export default function HeaderSummary({
               </div>
               <div className="mt-1.5 flex items-baseline gap-2">
                 <span className="text-2xl font-bold text-slate-900">
-                  {occupiedBedIdsTonight.size} / {beds.length}베드
+                  {occupiedBedIdsTonight.size} / {regularBeds.length}베드
                 </span>
                 <span className="text-xs font-semibold text-emerald-700 bg-emerald-100 px-2 py-0.5 rounded-md">
-                  잔여 {Math.max(0, beds.length - occupiedBedIdsTonight.size)}자리
+                  잔여 {Math.max(0, regularBeds.length - occupiedBedIdsTonight.size)}자리
                 </span>
+                {shabanaTonightCount > 0 && (
+                  <span className="text-xs font-semibold text-purple-700 bg-purple-100 px-2 py-0.5 rounded-md">
+                    샤바나 {shabanaTonightCount}명
+                  </span>
+                )}
               </div>
               <p className="text-[11px] text-slate-500 mt-1">
                 스태프 내부 취침 {tonightStaffInside.length}명
                 {tonightStaffOutside.length > 0
-                  ? ` · 외박 ${tonightStaffOutside.length}명 (인원 제외)`
+                  ? ` · 숙박안함/외박 ${tonightStaffOutside.length}명 (인원 제외)`
                   : ''}
               </p>
             </div>

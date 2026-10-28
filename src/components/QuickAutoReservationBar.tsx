@@ -294,6 +294,7 @@ export default function QuickAutoReservationBar({
                 <option value="4인실">4인실 우선 (4-1 ~ 4-4)</option>
                 <option value="2인실">2인실 우선 (2-1 ~ 2-2)</option>
                 <option value="1인실">1인실 우선 (1-1 · 2인 함께 사용 가능)</option>
+                <option value="샤바나">샤바나 지정 (인원 제한 없음 · 다인 숙박 가능)</option>
               </select>
             </div>
 

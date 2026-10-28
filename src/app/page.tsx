@@ -14,8 +14,10 @@ import {
   deleteStaff,
   fetchGuesthouseData,
   formatBedCode,
+  getStaffAssignmentForDate,
   INITIAL_BEDS,
   updateReservation,
+  updateStaffDateAssignments,
   updateStaffLocation,
   updateStaffProfile,
 } from '@/lib/supabase';
@@ -91,18 +93,19 @@ export default function PufferfishDashboardPage() {
     );
   }, [startDate]);
 
-  // Count total conflict cell-days in the visible 14-day window
+  // Count total conflict cell-days in the visible 14-day window (per-date schedule aware; 샤바나 excluded)
   const totalConflictCount = useMemo(() => {
     let count = 0;
     for (const dStr of dateStrings) {
       for (const s of staff) {
-        if (s.current_bed_id === null) continue;
-        const staffActive = s.check_in <= dStr && dStr < s.check_out;
-        if (!staffActive) continue;
+        const assign = getStaffAssignmentForDate(s, dStr);
+        if (assign.bed_id === null || assign.location_note !== '침대') continue;
+        const bedObj = beds.find((b) => b.id === assign.bed_id);
+        if (bedObj?.room_name === '샤바나') continue;
 
         const hasGuest = reservations.some(
           (r) =>
-            r.bed_id === s.current_bed_id &&
+            r.bed_id === assign.bed_id &&
             r.check_in <= dStr &&
             dStr < r.check_out
         );
@@ -110,7 +113,7 @@ export default function PufferfishDashboardPage() {
       }
     }
     return count;
-  }, [dateStrings, staff, reservations]);
+  }, [dateStrings, staff, reservations, beds]);
 
   const handleOpenNewReservation = () => {
     setModalInitialBedId(null);
@@ -173,10 +176,57 @@ export default function PufferfishDashboardPage() {
         );
         const bedObj =
           bedId !== null ? beds.find((b) => b.id === bedId) : null;
-        const label = bedObj
-          ? `${formatBedCode(bedObj)} 침대`
-          : locationNote;
-        showToast(`🛏️ ${updated.name} 취침 위치가 '${label}'(으)로 변경되었습니다.`);
+        const label =
+          bedObj && locationNote === '침대'
+            ? `${formatBedCode(bedObj)} 침대`
+            : locationNote === '외박'
+            ? '숙박 안 함(외박)'
+            : locationNote;
+        showToast(
+          `🛏️ ${updated.name} 기본 취침 위치가 '${label}'(으)로 변경되었습니다.`
+        );
+      }
+    } finally {
+      setUpdatingStaffId(null);
+    }
+  };
+
+  const handleChangeStaffDateLocation = async (
+    staffMember: Staff,
+    dates: string[],
+    bedId: number | null,
+    locationNote: StaffLocationNote | null
+  ) => {
+    setUpdatingStaffId(staffMember.id);
+    try {
+      const updated = await updateStaffDateAssignments(
+        staffMember,
+        dates,
+        bedId,
+        locationNote
+      );
+      setStaff((prev) =>
+        prev.map((s) => (s.id === staffMember.id ? updated : s))
+      );
+
+      if (locationNote === null) {
+        showToast(
+          `🔄 ${staffMember.name}님의 날짜별 개별 숙박 지정이 기본값으로 초기화되었습니다.`
+        );
+      } else {
+        const bedObj =
+          bedId !== null ? beds.find((b) => b.id === bedId) : null;
+        const label =
+          bedObj && locationNote === '침대'
+            ? `${formatBedCode(bedObj)} 침대`
+            : locationNote === '외박'
+            ? '숙박 안 함(외박)'
+            : locationNote;
+        const dateDesc =
+          dates.length === 1 ? dates[0] : `${dates.length}개 날짜`;
+        showToast(
+          `📅 ${staffMember.name}님의 [${dateDesc}] 숙박이 '${label}'(으)로 지정되었습니다.`
+        );
       }
     } finally {
       setUpdatingStaffId(null);
@@ -266,6 +316,7 @@ export default function PufferfishDashboardPage() {
               onClickEmptyCell={handleClickEmptyCell}
               onUpdateReservation={handleUpdateReservation}
               onDeleteReservation={handleDeleteReservation}
+              onChangeStaffDateLocation={handleChangeStaffDateLocation}
             />
 
             {/* 3. 그 밑에: 스태프 자리 배정 (StaffLocationController) */}
@@ -277,6 +328,7 @@ export default function PufferfishDashboardPage() {
               dateStrings={dateStrings}
               updatingStaffId={updatingStaffId}
               onChangeStaffLocation={handleChangeStaffLocation}
+              onChangeStaffDateLocation={handleChangeStaffDateLocation}
               onUpdateStaffProfile={handleUpdateStaffProfile}
               onCreateStaff={handleCreateStaff}
               onDeleteStaff={handleDeleteStaff}

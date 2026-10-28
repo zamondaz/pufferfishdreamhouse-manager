@@ -1,11 +1,12 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
-import { addDays, format, subDays } from 'date-fns';
+import { addDays, differenceInCalendarDays, format, parseISO, subDays } from 'date-fns';
 import {
   Bed,
   CreateReservationsPayload,
   CreateStaffPayload,
   Reservation,
   Staff,
+  StaffDailyAssignment,
   StaffLocationNote,
   UpdateReservationPayload,
   UpdateStaffProfilePayload,
@@ -30,7 +31,7 @@ export const supabase: SupabaseClient | null = isSupabaseConfigured
   ? createClient(supabaseUrl, supabaseAnonKey)
   : null;
 
-// Seed 12 beds: 5인실 (1-5), 4인실 (1-4), 2인실 (1-2), 1인실 (1)
+// Seed 13 beds: 5인실 (1-5), 4인실 (1-4), 2인실 (1-2), 1인실 (1), 샤바나 (1)
 export const INITIAL_BEDS: Bed[] = [
   { id: 1, room_name: '5인실', bed_number: 1 },
   { id: 2, room_name: '5인실', bed_number: 2 },
@@ -44,6 +45,7 @@ export const INITIAL_BEDS: Bed[] = [
   { id: 10, room_name: '2인실', bed_number: 1 },
   { id: 11, room_name: '2인실', bed_number: 2 },
   { id: 12, room_name: '1인실', bed_number: 1 },
+  { id: 13, room_name: '샤바나', bed_number: 1 },
 ];
 
 export function getInitialMockStaff(baseDate: Date = new Date()): Staff[] {
@@ -203,7 +205,31 @@ export function getInitialMockReservations(baseDate: Date = new Date()): Reserva
 const STORAGE_KEYS = {
   RESERVATIONS: 'pufferfish_mock_reservations_v1',
   STAFF: 'pufferfish_mock_staff_v1',
+  STAFF_DAILY: 'pufferfish_staff_daily_v1',
 };
+
+const STAFF_DAILY_GROUP_MARKER = '__STAFF_DAILY__';
+
+function loadLocalStaffDailyMap(): Record<string, Record<string, StaffDailyAssignment>> {
+  if (typeof window === 'undefined') return {};
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEYS.STAFF_DAILY);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveLocalStaffDailyMap(
+  map: Record<string, Record<string, StaffDailyAssignment>>
+): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(STORAGE_KEYS.STAFF_DAILY, JSON.stringify(map));
+  } catch {
+    // ignore storage errors
+  }
+}
 
 function loadMockState(): { beds: Bed[]; reservations: Reservation[]; staff: Staff[] } {
   if (typeof window === 'undefined') {
@@ -217,6 +243,7 @@ function loadMockState(): { beds: Bed[]; reservations: Reservation[]; staff: Sta
   try {
     const savedRes = window.localStorage.getItem(STORAGE_KEYS.RESERVATIONS);
     const savedStaff = window.localStorage.getItem(STORAGE_KEYS.STAFF);
+    const localDailyMap = loadLocalStaffDailyMap();
 
     const reservations: Reservation[] = savedRes
       ? JSON.parse(savedRes)
@@ -226,6 +253,10 @@ function loadMockState(): { beds: Bed[]; reservations: Reservation[]; staff: Sta
       ...s,
       location_note:
         (s.location_note as string) === '외부' ? '외박' : s.location_note,
+      daily_assignments: {
+        ...(s.daily_assignments || {}),
+        ...(localDailyMap[s.id] || {}),
+      },
     }));
 
     if (!savedRes) {
@@ -255,6 +286,7 @@ export function resetMockState(): { beds: Bed[]; reservations: Reservation[]; st
   if (typeof window !== 'undefined') {
     window.localStorage.setItem(STORAGE_KEYS.RESERVATIONS, JSON.stringify(reservations));
     window.localStorage.setItem(STORAGE_KEYS.STAFF, JSON.stringify(staff));
+    window.localStorage.removeItem(STORAGE_KEYS.STAFF_DAILY);
   }
   return { beds: INITIAL_BEDS, reservations, staff };
 }
@@ -274,7 +306,67 @@ export async function fetchGuesthouseData(): Promise<{
       ]);
 
       if (!bedsRes.error && !reservationsRes.error && !staffRes.error && bedsRes.data?.length) {
-        let finalReservations = (reservationsRes.data || []) as Reservation[];
+        let finalBeds = [...(bedsRes.data as Bed[])];
+
+        // Ensure '샤바나' (id: 13) exists in beds table and memory
+        if (!finalBeds.some((b) => b.room_name === '샤바나')) {
+          const shabanaBed: Bed = { id: 13, room_name: '샤바나', bed_number: 1 };
+          finalBeds.push(shabanaBed);
+          try {
+            const { data: insertedBed } = await supabase
+              .from('beds')
+              .upsert(shabanaBed, { onConflict: 'id' })
+              .select('*')
+              .single();
+            if (insertedBed) {
+              finalBeds = finalBeds.map((b) =>
+                b.room_name === '샤바나' ? (insertedBed as Bed) : b
+              );
+            }
+          } catch {
+            // ignore if upsert fails
+          }
+        }
+
+        const rawAllReservations = (reservationsRes.data || []) as Reservation[];
+        const dailyOverrideRows = rawAllReservations.filter(
+          (r) => r.group_code === STAFF_DAILY_GROUP_MARKER
+        );
+        let finalReservations = rawAllReservations.filter(
+          (r) => r.group_code !== STAFF_DAILY_GROUP_MARKER
+        );
+
+        // Parse staff daily overrides stored in reservations table + local cache
+        const remoteDailyMap: Record<string, Record<string, StaffDailyAssignment>> = {};
+        dailyOverrideRows.forEach((row) => {
+          const parts = row.guest_name.split('|');
+          if (parts.length >= 2) {
+            const staffId = parts[0];
+            const locNote = (parts[1] || '침대') as StaffLocationNote;
+            const bedIdRaw = parts[2];
+            const parsedBedId =
+              bedIdRaw && bedIdRaw !== 'null' && !Number.isNaN(Number(bedIdRaw))
+                ? Number(bedIdRaw)
+                : null;
+            if (!remoteDailyMap[staffId]) remoteDailyMap[staffId] = {};
+            remoteDailyMap[staffId][row.check_in] = {
+              bed_id: parsedBedId,
+              location_note: locNote,
+            };
+          }
+        });
+
+        const localDailyMap = loadLocalStaffDailyMap();
+        const mergedDailyMap: Record<string, Record<string, StaffDailyAssignment>> = {
+          ...localDailyMap,
+        };
+        Object.entries(remoteDailyMap).forEach(([sId, dateMap]) => {
+          mergedDailyMap[sId] = {
+            ...(mergedDailyMap[sId] || {}),
+            ...dateMap,
+          };
+        });
+        saveLocalStaffDailyMap(mergedDailyMap);
 
         // Auto-migrate existing browser localStorage reservations if Supabase table is initially empty
         if (finalReservations.length === 0 && typeof window !== 'undefined') {
@@ -283,14 +375,16 @@ export async function fetchGuesthouseData(): Promise<{
             try {
               const localList: Reservation[] = JSON.parse(savedLocalRes);
               if (localList.length > 0) {
-                const rowsToMigrate = localList.map((r) => ({
-                  guest_name: r.guest_name,
-                  gender: r.gender,
-                  bed_id: Number(r.bed_id),
-                  check_in: r.check_in,
-                  check_out: r.check_out,
-                  group_code: r.group_code,
-                }));
+                const rowsToMigrate = localList
+                  .filter((r) => r.group_code !== STAFF_DAILY_GROUP_MARKER)
+                  .map((r) => ({
+                    guest_name: r.guest_name,
+                    gender: r.gender,
+                    bed_id: Number(r.bed_id),
+                    check_in: r.check_in,
+                    check_out: r.check_out,
+                    group_code: r.group_code,
+                  }));
                 const { data: migratedData, error: migErr } = await supabase
                   .from('reservations')
                   .insert(rowsToMigrate)
@@ -305,10 +399,15 @@ export async function fetchGuesthouseData(): Promise<{
           }
         }
 
+        const finalStaff = ((staffRes.data || []) as Staff[]).map((s) => ({
+          ...s,
+          daily_assignments: mergedDailyMap[s.id] || {},
+        }));
+
         return {
-          beds: bedsRes.data as Bed[],
+          beds: finalBeds,
           reservations: finalReservations,
-          staff: (staffRes.data || []) as Staff[],
+          staff: finalStaff,
           usingMock: false,
         };
       }
@@ -419,7 +518,9 @@ export async function updateReservation(
       .order('check_in', { ascending: true });
 
     if (!error && data) {
-      return data as Reservation[];
+      return (data as Reservation[]).filter(
+        (r) => r.group_code !== STAFF_DAILY_GROUP_MARKER
+      );
     }
   }
 
@@ -465,7 +566,9 @@ export async function updateStaffLocation(
   currentBedId: number | null,
   locationNote: StaffLocationNote
 ): Promise<Staff | null> {
-  const normalizedNote: StaffLocationNote = currentBedId !== null ? '침대' : locationNote;
+  const normalizedNote: StaffLocationNote =
+    currentBedId !== null && locationNote !== '샤바나' ? '침대' : locationNote;
+  const localDailyMap = loadLocalStaffDailyMap();
 
   if (supabase) {
     const { data, error } = await supabase
@@ -479,7 +582,10 @@ export async function updateStaffLocation(
       .single();
 
     if (!error && data) {
-      return data as Staff;
+      return {
+        ...(data as Staff),
+        daily_assignments: localDailyMap[staffId] || {},
+      };
     }
   }
 
@@ -491,6 +597,7 @@ export async function updateStaffLocation(
         ...s,
         current_bed_id: currentBedId,
         location_note: normalizedNote,
+        daily_assignments: localDailyMap[staffId] || s.daily_assignments || {},
       };
       return updatedStaffMember;
     }
@@ -503,6 +610,93 @@ export async function updateStaffLocation(
   return updatedStaffMember;
 }
 
+/**
+ * Updates date-specific accommodation assignments for a staff member.
+ * Pass `locationNote = null` to clear custom date overrides for `dates` (reverts to default).
+ */
+export async function updateStaffDateAssignments(
+  staffMember: Staff,
+  dates: string[],
+  bedId: number | null,
+  locationNote: StaffLocationNote | null
+): Promise<Staff> {
+  const staffId = staffMember.id;
+  const localDailyMap = loadLocalStaffDailyMap();
+  const currentForStaff: Record<string, StaffDailyAssignment> = {
+    ...(staffMember.daily_assignments || {}),
+    ...(localDailyMap[staffId] || {}),
+  };
+
+  const normalizedNote: StaffLocationNote | null =
+    locationNote === null
+      ? null
+      : bedId !== null && locationNote !== '샤바나'
+      ? '침대'
+      : locationNote;
+
+  dates.forEach((dStr) => {
+    if (normalizedNote === null) {
+      delete currentForStaff[dStr];
+    } else {
+      currentForStaff[dStr] = {
+        bed_id: bedId,
+        location_note: normalizedNote,
+      };
+    }
+  });
+
+  localDailyMap[staffId] = currentForStaff;
+  saveLocalStaffDailyMap(localDailyMap);
+
+  // Sync to localStorage mock staff as well
+  if (typeof window !== 'undefined') {
+    try {
+      const savedStaff = window.localStorage.getItem(STORAGE_KEYS.STAFF);
+      if (savedStaff) {
+        const list: Staff[] = JSON.parse(savedStaff);
+        const nextList = list.map((s) =>
+          s.id === staffId ? { ...s, daily_assignments: currentForStaff } : s
+        );
+        window.localStorage.setItem(STORAGE_KEYS.STAFF, JSON.stringify(nextList));
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  // Sync to Supabase via reservations table marker rows
+  if (supabase && dates.length > 0) {
+    try {
+      // Delete existing marker rows for this staff and these dates
+      await supabase
+        .from('reservations')
+        .delete()
+        .eq('group_code', STAFF_DAILY_GROUP_MARKER)
+        .like('guest_name', `${staffId}|%`)
+        .in('check_in', dates);
+
+      if (normalizedNote !== null) {
+        const rowsToInsert = dates.map((dStr) => ({
+          guest_name: `${staffId}|${normalizedNote}|${bedId ?? 'null'}`,
+          gender: staffMember.gender,
+          bed_id: bedId ?? 1, // satisfies FK constraint on beds(id)
+          check_in: dStr,
+          check_out: format(addDays(parseISO(dStr), 1), 'yyyy-MM-dd'),
+          group_code: STAFF_DAILY_GROUP_MARKER,
+        }));
+        await supabase.from('reservations').insert(rowsToInsert);
+      }
+    } catch {
+      // fallback already saved in localDailyMap
+    }
+  }
+
+  return {
+    ...staffMember,
+    daily_assignments: { ...currentForStaff },
+  };
+}
+
 export async function updateStaffProfile(
   payload: UpdateStaffProfilePayload
 ): Promise<Staff | null> {
@@ -512,6 +706,7 @@ export async function updateStaffProfile(
   };
   if (payload.check_in) patch.check_in = payload.check_in;
   if (payload.check_out) patch.check_out = payload.check_out;
+  const localDailyMap = loadLocalStaffDailyMap();
 
   if (supabase) {
     const { data, error } = await supabase
@@ -522,7 +717,10 @@ export async function updateStaffProfile(
       .single();
 
     if (!error && data) {
-      return data as Staff;
+      return {
+        ...(data as Staff),
+        daily_assignments: localDailyMap[payload.id] || {},
+      };
     }
   }
 
@@ -536,6 +734,7 @@ export async function updateStaffProfile(
         gender: payload.gender,
         check_in: payload.check_in || s.check_in,
         check_out: payload.check_out || s.check_out,
+        daily_assignments: localDailyMap[payload.id] || s.daily_assignments || {},
       };
       return updatedStaffMember;
     }
@@ -555,7 +754,9 @@ export async function createStaff(
   payload: CreateStaffPayload
 ): Promise<Staff | null> {
   const normalizedNote: StaffLocationNote =
-    payload.current_bed_id !== null ? '침대' : payload.location_note;
+    payload.current_bed_id !== null && payload.location_note !== '샤바나'
+      ? '침대'
+      : payload.location_note;
 
   if (supabase) {
     const { data, error } = await supabase
@@ -572,7 +773,7 @@ export async function createStaff(
       .single();
 
     if (!error && data) {
-      return data as Staff;
+      return { ...(data as Staff), daily_assignments: {} };
     }
   }
 
@@ -585,6 +786,7 @@ export async function createStaff(
     check_out: payload.check_out,
     current_bed_id: payload.current_bed_id,
     location_note: normalizedNote,
+    daily_assignments: {},
   };
   const updatedList = [...mock.staff, created];
   if (typeof window !== 'undefined') {
@@ -594,7 +796,16 @@ export async function createStaff(
 }
 
 export async function deleteStaff(staffId: string): Promise<void> {
+  const localDailyMap = loadLocalStaffDailyMap();
+  delete localDailyMap[staffId];
+  saveLocalStaffDailyMap(localDailyMap);
+
   if (supabase) {
+    await supabase
+      .from('reservations')
+      .delete()
+      .eq('group_code', STAFF_DAILY_GROUP_MARKER)
+      .like('guest_name', `${staffId}|%`);
     const { error } = await supabase.from('staff').delete().eq('id', staffId);
     if (!error) return;
   }
@@ -615,25 +826,93 @@ export function isStaffSleepingInside(locationNote: string): boolean {
 }
 
 /**
- * Formats bed label as "5-1", "4-2", "2-1", "1-1"
+ * Returns the effective accommodation assignment for `staffMember` on `dateStr` (YYYY-MM-DD).
+ * Checks per-date `daily_assignments[dateStr]` first; falls back to the staff's default
+ * if `dateStr` is within `[check_in, check_out)`, otherwise returns `{ bed_id: null, location_note: '외박' }`.
+ */
+export function getStaffAssignmentForDate(
+  staffMember: Staff,
+  dateStr: string
+): StaffDailyAssignment & { isCustomDate: boolean } {
+  const custom = staffMember.daily_assignments?.[dateStr];
+  if (custom) {
+    return { ...custom, isCustomDate: true };
+  }
+  const inDefaultRange =
+    staffMember.check_in <= dateStr && dateStr < staffMember.check_out;
+  if (!inDefaultRange) {
+    return { bed_id: null, location_note: '외박', isCustomDate: false };
+  }
+  return {
+    bed_id: staffMember.current_bed_id,
+    location_note: staffMember.location_note,
+    isCustomDate: false,
+  };
+}
+
+/**
+ * Returns true if the staff member is staying inside the guesthouse on `dateStr`.
+ */
+export function isStaffStayingOnDate(
+  staffMember: Staff,
+  dateStr: string
+): boolean {
+  const assign = getStaffAssignmentForDate(staffMember, dateStr);
+  return isStaffSleepingInside(assign.location_note);
+}
+
+/**
+ * Calculates the number of nights for a reservation `[checkIn, checkOut)`.
+ */
+export function getReservationNights(checkIn: string, checkOut: string): number {
+  try {
+    return Math.max(
+      0,
+      differenceInCalendarDays(parseISO(checkOut), parseISO(checkIn))
+    );
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Calculates the 1-based stay day index (`1일차`, `2일차`, ...) for `dateStr` within `[checkIn, checkOut)`.
+ */
+export function getCurrentStayDayIndex(checkIn: string, dateStr: string): number {
+  try {
+    return Math.max(
+      1,
+      differenceInCalendarDays(parseISO(dateStr), parseISO(checkIn)) + 1
+    );
+  } catch {
+    return 1;
+  }
+}
+
+/**
+ * Formats bed label as "5-1", "4-2", "2-1", "1-1", or "샤바나"
  */
 export function formatBedCode(bed: Bed): string {
+  if (bed.room_name === '샤바나') return '샤바나';
   const roomNum = bed.room_name.replace(/[^0-9]/g, '');
   return `${roomNum || bed.room_name}-${bed.bed_number}`;
 }
 
 /**
  * Returns max guest capacity for a single bed.
- * 1인실 (1-1) can be used by up to 2 guests together (2인 동반 사용 가능).
+ * - 샤바나: unlimited (999)
+ * - 1인실 (1-1): up to 2 guests together (2인 동반 사용 가능)
+ * - Others: 1 guest
  */
 export function getBedMaxCapacity(bed: Bed): number {
+  if (bed.room_name === '샤바나') return 999;
   return bed.room_name === '1인실' ? 2 : 1;
 }
 
 /**
  * Automatically assigns the best empty beds for `guestCount` guests during [checkIn, checkOut).
  * Prioritizes:
- * 1) Preferred room if specified (including 1인실 2-person sharing when 1인실 is chosen)
+ * 1) Preferred room if specified (including '샤바나' unlimited capacity or '1인실' 2-person sharing)
  * 2) Beds without staff conflicts (Tier 1) before beds with resident staff (Tier 2)
  * 3) Keeping companions in the same room (closest-fitting room capacity first)
  */
@@ -662,6 +941,18 @@ export function autoAssignEmptyBeds({
     return { assignedBedIds: [], totalAvailableCount: 0, usesStaffBed: false };
   }
 
+  // If user explicitly prefers '샤바나', assign all guests to 샤바나 (unlimited capacity)
+  const shabanaBed = beds.find((b) => b.room_name === '샤바나');
+  if (preferredRoom === '샤바나' && shabanaBed) {
+    return {
+      assignedBedIds: Array(guestCount).fill(shabanaBed.id),
+      totalAvailableCount: 999,
+      usesStaffBed: false,
+    };
+  }
+
+  const regularBeds = beds.filter((b) => b.room_name !== '샤바나');
+
   // Count how many guests are already booked in each bed overlapping [checkIn, checkOut)
   const guestCountByBedId = new Map<number, number>();
   reservations.forEach((r) => {
@@ -670,24 +961,29 @@ export function autoAssignEmptyBeds({
     }
   });
 
+  // Check which beds are occupied by staff on any date within [checkIn, checkOut)
   const staffOccupiedBedIds = new Set<number>();
+  const nights = getReservationNights(checkIn, checkOut);
+  const stayDates = Array.from({ length: Math.min(nights, 60) }, (_, i) =>
+    format(addDays(parseISO(checkIn), i), 'yyyy-MM-dd')
+  );
+
   staff.forEach((s) => {
-    if (
-      s.current_bed_id !== null &&
-      s.check_in < checkOut &&
-      s.check_out > checkIn
-    ) {
-      staffOccupiedBedIds.add(s.current_bed_id);
-    }
+    stayDates.forEach((dStr) => {
+      const assign = getStaffAssignmentForDate(s, dStr);
+      if (assign.bed_id !== null && assign.location_note === '침대') {
+        staffOccupiedBedIds.add(assign.bed_id);
+      }
+    });
   });
 
-  // Beds with 0 guests currently booked
-  const availableBeds = beds.filter(
+  // Regular beds with 0 guests currently booked
+  const availableBeds = regularBeds.filter(
     (b) => (guestCountByBedId.get(b.id) || 0) === 0
   );
 
   // Special case: 1인실 (1-1) can hold up to 2 guests
-  const singleRoomBed = beds.find((b) => b.room_name === '1인실');
+  const singleRoomBed = regularBeds.find((b) => b.room_name === '1인실');
   const singleRoomCurrentGuests = singleRoomBed
     ? guestCountByBedId.get(singleRoomBed.id) || 0
     : 2;
@@ -748,7 +1044,6 @@ export function autoAssignEmptyBeds({
     if (remainingNeeded <= 0) return result;
 
     // 2. Try to find a single room that can fit all `remainingNeeded` guests together
-    // Sort candidate rooms by smallest excess capacity so 1 guest prefers 1인실/2인실, 2 guests prefer 2인실, etc.
     const candidateRooms = Array.from(byRoom.entries())
       .map(([roomName, roomBeds]) => ({
         roomName,

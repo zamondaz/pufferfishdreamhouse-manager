@@ -5,13 +5,17 @@ import { addDays, format, parseISO } from 'date-fns';
 import { ko } from 'date-fns/locale';
 import {
   AlertTriangle,
+  Calculator,
   Calendar as CalendarIcon,
   Check,
   ChevronLeft,
   ChevronRight,
+  Moon,
   Pencil,
   Plus,
+  Search,
   Trash2,
+  UserCheck,
   Users,
   X,
 } from 'lucide-react';
@@ -19,6 +23,9 @@ import {
   formatBedCode,
   generateGroupCode,
   getBedMaxCapacity,
+  getCurrentStayDayIndex,
+  getReservationNights,
+  getStaffAssignmentForDate,
   isStaffSleepingInside,
 } from '@/lib/supabase';
 import {
@@ -26,6 +33,7 @@ import {
   Gender,
   Reservation,
   Staff,
+  StaffLocationNote,
   UpdateReservationPayload,
 } from '@/types/guesthouse';
 
@@ -39,6 +47,12 @@ interface BedMapCalendarProps {
   onClickEmptyCell: (bedId: number, dateStr: string) => void;
   onUpdateReservation: (payload: UpdateReservationPayload) => Promise<void>;
   onDeleteReservation: (reservationId: string) => void;
+  onChangeStaffDateLocation: (
+    staffMember: Staff,
+    dates: string[],
+    bedId: number | null,
+    locationNote: StaffLocationNote | null
+  ) => Promise<void>;
 }
 
 const GROUP_PALETTES = [
@@ -118,10 +132,25 @@ export default function BedMapCalendar({
   onClickEmptyCell,
   onUpdateReservation,
   onDeleteReservation,
+  onChangeStaffDateLocation,
 }: BedMapCalendarProps) {
   const [hoveredGroupCode, setHoveredGroupCode] = useState<string | null>(null);
   const [selectedReservation, setSelectedReservation] =
     useState<Reservation | null>(null);
+
+  // Quick staff per-date assignment modal state (triggered from calendar cells or 샤바나 row)
+  const [staffDateModal, setStaffDateModal] = useState<{
+    dateStr: string;
+    initialStaffId?: string;
+    defaultTarget?: '샤바나' | '침대';
+    targetBedId?: number;
+  } | null>(null);
+
+  // Guest stay calculator search & filter states
+  const [guestSearchQuery, setGuestSearchQuery] = useState<string>('');
+  const [guestFilterScope, setGuestFilterScope] = useState<
+    'ALL' | 'WINDOW' | 'TODAY'
+  >('ALL');
 
   // Edit form states inside the Reservation Detail/Edit Modal
   const [editGuestName, setEditGuestName] = useState<string>('');
@@ -164,9 +193,9 @@ export default function BedMapCalendar({
     });
   }, [startDate, todayStr]);
 
-  // Group beds by room_name preserving order: 5인실, 4인실, 2인실, 1인실
+  // Group beds by room_name preserving order: 5인실, 4인실, 2인실, 1인실, 샤바나
   const groupedRooms = useMemo(() => {
-    const order = ['5인실', '4인실', '2인실', '1인실'];
+    const order = ['5인실', '4인실', '2인실', '1인실', '샤바나'];
     const map = new Map<string, Bed[]>();
     order.forEach((r) => map.set(r, []));
 
@@ -176,10 +205,12 @@ export default function BedMapCalendar({
       map.set(b.room_name, list);
     });
 
-    return Array.from(map.entries()).filter(([, roomBeds]) => roomBeds.length > 0);
+    return Array.from(map.entries()).filter(
+      ([, roomBeds]) => roomBeds.length > 0
+    );
   }, [beds]);
 
-  // Map every group_code across reservations to a unique palette index (no hash collisions)
+  // Map every group_code across reservations to a unique palette index
   const { groupPaletteMap, groupMembersMap } = useMemo(() => {
     const paletteMap = new Map<string, (typeof GROUP_PALETTES)[number]>();
     const membersMap = new Map<string, string[]>();
@@ -227,18 +258,101 @@ export default function BedMapCalendar({
     return Array.from(codes.entries());
   }, [reservations, days]);
 
-  // Calculate daily total headcount (Guests + Staff sleeping inside) for each column
+  // Per-guest cumulative stay calculation map (by normalized guest_name)
+  const guestStayStatsList = useMemo(() => {
+    const windowStart = days[0]?.dateStr || '';
+    const windowEndExclusive =
+      days.length > 0
+        ? format(addDays(days[days.length - 1].dateObj, 1), 'yyyy-MM-dd')
+        : '';
+
+    const byName = new Map<
+      string,
+      {
+        guestName: string;
+        gender: Gender;
+        totalNights: number;
+        windowNights: number;
+        isStayingToday: boolean;
+        groupCodes: string[];
+        reservations: (Reservation & { nights: number; bedLabel: string })[];
+      }
+    >();
+
+    reservations.forEach((r) => {
+      const key = r.guest_name.trim().toLowerCase();
+      const nights = getReservationNights(r.check_in, r.check_out);
+      const bedObj = beds.find((b) => b.id === r.bed_id);
+      const bedLabel = bedObj ? formatBedCode(bedObj) : `#${r.bed_id}`;
+
+      // Calculate overlap nights with the visible 14-day window
+      const overlapStart = r.check_in > windowStart ? r.check_in : windowStart;
+      const overlapEnd =
+        r.check_out < windowEndExclusive ? r.check_out : windowEndExclusive;
+      const winNights =
+        overlapEnd > overlapStart
+          ? getReservationNights(overlapStart, overlapEnd)
+          : 0;
+
+      const stayingToday = r.check_in <= todayStr && todayStr < r.check_out;
+
+      const existing = byName.get(key);
+      if (existing) {
+        existing.totalNights += nights;
+        existing.windowNights += winNights;
+        if (stayingToday) existing.isStayingToday = true;
+        if (r.group_code && !existing.groupCodes.includes(r.group_code)) {
+          existing.groupCodes.push(r.group_code);
+        }
+        existing.reservations.push({ ...r, nights, bedLabel });
+      } else {
+        byName.set(key, {
+          guestName: r.guest_name.trim(),
+          gender: r.gender,
+          totalNights: nights,
+          windowNights: winNights,
+          isStayingToday: stayingToday,
+          groupCodes: r.group_code ? [r.group_code] : [],
+          reservations: [{ ...r, nights, bedLabel }],
+        });
+      }
+    });
+
+    return Array.from(byName.values()).sort(
+      (a, b) =>
+        b.totalNights - a.totalNights ||
+        a.guestName.localeCompare(b.guestName, 'ko')
+    );
+  }, [reservations, beds, days, todayStr]);
+
+  const guestTotalNightsMap = useMemo(() => {
+    const map = new Map<string, number>();
+    guestStayStatsList.forEach((stat) => {
+      map.set(stat.guestName.toLowerCase(), stat.totalNights);
+    });
+    return map;
+  }, [guestStayStatsList]);
+
+  const filteredGuestStats = useMemo(() => {
+    const q = guestSearchQuery.trim().toLowerCase();
+    return guestStayStatsList.filter((item) => {
+      if (guestFilterScope === 'WINDOW' && item.windowNights <= 0) return false;
+      if (guestFilterScope === 'TODAY' && !item.isStayingToday) return false;
+      if (q && !item.guestName.toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }, [guestStayStatsList, guestFilterScope, guestSearchQuery]);
+
+  // Calculate daily total headcount (Guests + Staff sleeping inside on each date)
   const dailyHeadcounts = useMemo(() => {
     return days.map((d) => {
       const gCount = reservations.filter(
         (r) => r.check_in <= d.dateStr && d.dateStr < r.check_out
       ).length;
-      const sCount = staff.filter(
-        (s) =>
-          s.check_in <= d.dateStr &&
-          d.dateStr < s.check_out &&
-          isStaffSleepingInside(s.location_note)
-      ).length;
+      const sCount = staff.filter((s) => {
+        const assign = getStaffAssignmentForDate(s, d.dateStr);
+        return isStaffSleepingInside(assign.location_note);
+      }).length;
       return {
         guestCount: gCount,
         staffInsideCount: sCount,
@@ -247,20 +361,40 @@ export default function BedMapCalendar({
     });
   }, [days, reservations, staff]);
 
+  const editNightsCount = useMemo(
+    () => getReservationNights(editCheckIn, editCheckOut),
+    [editCheckIn, editCheckOut]
+  );
+
+  const editGuestOtherReservationsNights = useMemo(() => {
+    if (!selectedReservation || !editGuestName.trim()) return 0;
+    return reservations
+      .filter(
+        (r) =>
+          r.id !== selectedReservation.id &&
+          r.guest_name.trim().toLowerCase() ===
+            editGuestName.trim().toLowerCase()
+      )
+      .reduce((acc, r) => acc + getReservationNights(r.check_in, r.check_out), 0);
+  }, [reservations, selectedReservation, editGuestName]);
+
   return (
-    <section className="max-w-[1600px] mx-auto px-4 sm:px-6 mt-5">
+    <section className="max-w-[1600px] mx-auto px-4 sm:px-6 mt-5 space-y-5">
       <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
         {/* Calendar Toolbar */}
         <div className="p-4 sm:p-5 border-b border-slate-200 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
           <div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <CalendarIcon className="w-5 h-5 text-indigo-600" />
               <h2 className="text-lg font-extrabold text-slate-900">
-                객실·침대 통합 베드맵 캘린더 (14일 뷰)
+                객실·침대·샤바나 통합 베드맵 캘린더 (14일 뷰)
               </h2>
+              <span className="px-2 py-0.5 rounded-full bg-purple-100 text-purple-800 border border-purple-200 text-[11px] font-bold">
+                ⛺ 샤바나 다인(인원 무제한) 숙박 &amp; 게스트별 숙박일수 표시 지원
+              </span>
             </div>
             <p className="text-xs text-slate-500 mt-0.5">
-              빈 칸을 클릭하면 해당 날짜·침대로 즉시 예약을 추가할 수 있습니다. 일행(그룹코드)은 같은 테두리 색상으로 묶여 표시됩니다.
+              빈 칸이나 샤바나 칸을 클릭하면 게스트/스태프 숙박을 즉시 배정할 수 있으며, 각 게스트 칸에 숙박 박수(일차/총박수)가 자동 계산됩니다.
             </p>
           </div>
 
@@ -319,12 +453,18 @@ export default function BedMapCalendar({
               <span className="px-1.5 py-0.5 rounded bg-rose-100 text-rose-800 font-bold text-[10px]">
                 여
               </span>
-              <span className="text-slate-600">게스트 예약</span>
+              <span className="text-slate-600">게스트 예약 (박수 표시)</span>
             </span>
             <span className="inline-flex items-center gap-1.5">
               <span className="w-3 h-3 rounded bg-emerald-100 border border-emerald-500 inline-block" />
               <span className="text-emerald-800 font-semibold">
-                상주 스태프 취침 (초록)
+                상주 스태프 숙박 (클릭 시 날짜별 변경)
+              </span>
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <span className="w-3 h-3 rounded bg-purple-100 border border-purple-400 inline-block" />
+              <span className="text-purple-800 font-semibold">
+                ⛺ 샤바나 (인원 제한 없음 · 게스트/스태프 모두 배정 가능)
               </span>
             </span>
             <span className="inline-flex items-center gap-1.5">
@@ -351,7 +491,9 @@ export default function BedMapCalendar({
                     onMouseEnter={() => setHoveredGroupCode(code)}
                     onMouseLeave={() => setHoveredGroupCode(null)}
                     onClick={() =>
-                      setHoveredGroupCode((prev) => (prev === code ? null : code))
+                      setHoveredGroupCode((prev) =>
+                        prev === code ? null : code
+                      )
                     }
                     className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-[11px] font-bold transition-all cursor-pointer ${
                       pal.bg
@@ -372,14 +514,14 @@ export default function BedMapCalendar({
 
         {/* Matrix Table Container */}
         <div className="overflow-x-auto">
-          <table className="w-full border-collapse min-w-[1180px] table-fixed">
+          <table className="w-full border-collapse min-w-[1220px] table-fixed">
             <thead>
               <tr className="bg-slate-100/90 border-b border-slate-200">
                 <th className="w-24 py-3 px-2 text-left text-xs font-extrabold text-slate-700 border-r border-slate-200 sticky left-0 bg-slate-100 z-20">
                   객실
                 </th>
                 <th className="w-24 py-3 px-2 text-left text-xs font-extrabold text-slate-700 border-r border-slate-200 sticky left-24 bg-slate-100 z-20">
-                  침대 번호
+                  침대/공간
                 </th>
                 {days.map((d) => (
                   <th
@@ -421,258 +563,508 @@ export default function BedMapCalendar({
             </thead>
 
             <tbody className="divide-y divide-slate-200">
-              {groupedRooms.map(([roomName, roomBeds]) => (
-                <React.Fragment key={roomName}>
-                  {roomBeds.map((bed, bedIndex) => (
-                    <tr
-                      key={bed.id}
-                      className={`group/row hover:bg-slate-50/60 transition-colors ${
-                        bedIndex === roomBeds.length - 1
-                          ? 'border-b-2 border-b-slate-300'
-                          : ''
-                      }`}
-                    >
-                      {/* Room Name Column (Rowspan per room) */}
-                      {bedIndex === 0 && (
+              {groupedRooms.map(([roomName, roomBeds]) => {
+                const isShabanaRoom = roomName === '샤바나';
+                return (
+                  <React.Fragment key={roomName}>
+                    {roomBeds.map((bed, bedIndex) => (
+                      <tr
+                        key={bed.id}
+                        className={`group/row transition-colors ${
+                          isShabanaRoom
+                            ? 'bg-purple-50/25 hover:bg-purple-50/50'
+                            : 'hover:bg-slate-50/60'
+                        } ${
+                          bedIndex === roomBeds.length - 1
+                            ? 'border-b-2 border-b-slate-300'
+                            : ''
+                        }`}
+                      >
+                        {/* Room Name Column (Rowspan per room) */}
+                        {bedIndex === 0 && (
+                          <td
+                            rowSpan={roomBeds.length}
+                            className={`py-3 px-3 align-middle border-r border-slate-200 sticky left-0 z-10 ${
+                              isShabanaRoom ? 'bg-purple-50' : 'bg-slate-50'
+                            }`}
+                          >
+                            <div className="flex flex-col">
+                              <span
+                                className={`text-sm font-extrabold ${
+                                  isShabanaRoom
+                                    ? 'text-purple-950'
+                                    : 'text-slate-900'
+                                }`}
+                              >
+                                {isShabanaRoom ? '⛺ 샤바나' : roomName}
+                              </span>
+                              <span
+                                className={`text-[11px] font-medium ${
+                                  isShabanaRoom
+                                    ? 'text-purple-700 font-bold'
+                                    : 'text-slate-500'
+                                }`}
+                              >
+                                {isShabanaRoom
+                                  ? '인원 제한 없음'
+                                  : roomName === '1인실'
+                                  ? '1~2인 사용 가능'
+                                  : `혼숙 · ${roomBeds.length}베드`}
+                              </span>
+                            </div>
+                          </td>
+                        )}
+
+                        {/* Bed Number Column */}
                         <td
-                          rowSpan={roomBeds.length}
-                          className="py-3 px-3 align-middle bg-slate-50 border-r border-slate-200 sticky left-0 z-10"
+                          className={`py-2.5 px-2.5 border-r border-slate-200 sticky left-24 z-10 ${
+                            isShabanaRoom
+                              ? 'bg-purple-50/70 group-hover/row:bg-purple-50'
+                              : 'bg-white group-hover/row:bg-slate-50'
+                          }`}
                         >
-                          <div className="flex flex-col">
-                            <span className="text-sm font-extrabold text-slate-900">
-                              {roomName}
-                            </span>
-                            <span className="text-[11px] text-slate-500 font-medium">
-                              {roomName === '1인실'
-                                ? '1~2인 사용 가능'
-                                : `혼숙 · ${roomBeds.length}베드`}
-                            </span>
+                          <div className="flex flex-col gap-0.5">
+                            <div className="flex items-center justify-between">
+                              <span
+                                className={`text-xs font-extrabold px-2 py-0.5 rounded-md border ${
+                                  isShabanaRoom
+                                    ? 'text-purple-950 bg-purple-100 border-purple-300'
+                                    : 'text-indigo-950 bg-slate-100 border-slate-200'
+                                }`}
+                              >
+                                {formatBedCode(bed)}
+                              </span>
+                              {bed.room_name === '1인실' && (
+                                <span className="text-[10px] text-indigo-600 font-bold">
+                                  최대2인
+                                </span>
+                              )}
+                              {isShabanaRoom && (
+                                <span className="text-[10px] text-purple-700 font-extrabold">
+                                  무제한
+                                </span>
+                              )}
+                            </div>
+                            {isShabanaRoom && (
+                              <span className="text-[9px] text-purple-600 font-semibold">
+                                게스트·스태프 다인
+                              </span>
+                            )}
                           </div>
                         </td>
-                      )}
 
-                      {/* Bed Number Column (5-1, 4-1, 2-1, 1-1) */}
-                      <td className="py-2.5 px-2.5 bg-white group-hover/row:bg-slate-50 border-r border-slate-200 sticky left-24 z-10">
-                        <div className="flex items-center justify-between">
-                          <span className="text-xs font-extrabold text-indigo-950 bg-slate-100 px-2 py-0.5 rounded-md border border-slate-200">
-                            {formatBedCode(bed)}
-                          </span>
-                          {bed.room_name === '1인실' && (
-                            <span className="text-[10px] text-indigo-600 font-bold">
-                              최대2인
-                            </span>
-                          )}
-                        </div>
-                      </td>
-
-                      {/* 14 Date Cells */}
-                      {days.map((d) => {
-                        // Find all guest reservations occupying this bed on date d (1인실 can have up to 2 guests)
-                        const cellGuests = reservations.filter(
-                          (r) =>
-                            r.bed_id === bed.id &&
-                            r.check_in <= d.dateStr &&
-                            d.dateStr < r.check_out
-                        );
-                        const primaryGuest = cellGuests[0] || null;
-                        const maxCap = getBedMaxCapacity(bed);
-
-                        // Find staff member assigned to this bed on date d
-                        const assignedStaff = staff.find(
-                          (s) =>
-                            s.current_bed_id === bed.id &&
-                            s.check_in <= d.dateStr &&
-                            d.dateStr < s.check_out
-                        );
-
-                        const isConflict = Boolean(primaryGuest && assignedStaff);
-
-                        // Case 1 & 2: Guest occupied (1 or 2 guests in cell, with or without staff conflict)
-                        if (primaryGuest) {
-                          const groupPalette = primaryGuest.group_code
-                            ? getGroupPalette(primaryGuest.group_code)
-                            : null;
-                          const groupCount = primaryGuest.group_code
-                            ? groupMembersMap.get(primaryGuest.group_code)?.length ||
-                              cellGuests.length
-                            : cellGuests.length;
-                          const isGroupHighlighted = Boolean(
-                            primaryGuest.group_code &&
-                              hoveredGroupCode === primaryGuest.group_code
+                        {/* 14 Date Cells */}
+                        {days.map((d) => {
+                          // Guests occupying this bed on date d
+                          const cellGuests = reservations.filter(
+                            (r) =>
+                              r.bed_id === bed.id &&
+                              r.check_in <= d.dateStr &&
+                              d.dateStr < r.check_out
                           );
-                          const isDimmed =
-                            hoveredGroupCode !== null &&
-                            primaryGuest.group_code !== hoveredGroupCode;
+                          const primaryGuest = cellGuests[0] || null;
+                          const maxCap = getBedMaxCapacity(bed);
 
-                          return (
-                            <td
-                              key={d.dateStr}
-                              onMouseEnter={() =>
-                                primaryGuest.group_code &&
-                                setHoveredGroupCode(primaryGuest.group_code)
-                              }
-                              onMouseLeave={() => setHoveredGroupCode(null)}
-                              onClick={() => openReservationEditor(primaryGuest)}
-                              className={`p-1 border-r border-slate-200 align-top cursor-pointer transition-all ${
-                                isConflict
-                                  ? 'bg-amber-50/60'
-                                  : d.isToday
-                                  ? 'bg-indigo-50/30'
-                                  : ''
-                              }`}
-                            >
-                              <div
-                                className={`h-full min-h-[58px] rounded-lg p-1.5 flex flex-col justify-between transition-all ${
+                          // Staff members assigned to this bed on date d (per-date schedule aware)
+                          const cellStaffList = staff.filter((s) => {
+                            const assign = getStaffAssignmentForDate(
+                              s,
+                              d.dateStr
+                            );
+                            if (isShabanaRoom) {
+                              return (
+                                assign.location_note === '샤바나' ||
+                                assign.bed_id === bed.id
+                              );
+                            }
+                            return (
+                              assign.location_note === '침대' &&
+                              assign.bed_id === bed.id
+                            );
+                          });
+                          const primaryStaff = cellStaffList[0] || null;
+
+                          // 샤바나 has unlimited capacity so guests + staff together is never a conflict
+                          const isConflict =
+                            !isShabanaRoom &&
+                            Boolean(
+                              (primaryGuest && primaryStaff) ||
+                                cellStaffList.length > 1
+                            );
+
+                          // Special rendering when cell has guests OR (in 샤바나, guests and/or staff)
+                          if (primaryGuest || (isShabanaRoom && primaryStaff)) {
+                            const groupPalette = primaryGuest?.group_code
+                              ? getGroupPalette(primaryGuest.group_code)
+                              : null;
+                            const groupCount = primaryGuest?.group_code
+                              ? groupMembersMap.get(primaryGuest.group_code)
+                                  ?.length || cellGuests.length
+                              : cellGuests.length;
+                            const isGroupHighlighted = Boolean(
+                              primaryGuest?.group_code &&
+                                hoveredGroupCode === primaryGuest.group_code
+                            );
+                            const isDimmed =
+                              hoveredGroupCode !== null &&
+                              primaryGuest?.group_code !== hoveredGroupCode;
+
+                            return (
+                              <td
+                                key={d.dateStr}
+                                onMouseEnter={() =>
+                                  primaryGuest?.group_code &&
+                                  setHoveredGroupCode(primaryGuest.group_code)
+                                }
+                                onMouseLeave={() => setHoveredGroupCode(null)}
+                                onClick={() => {
+                                  if (primaryGuest) {
+                                    openReservationEditor(primaryGuest);
+                                  } else if (isShabanaRoom) {
+                                    onClickEmptyCell(bed.id, d.dateStr);
+                                  }
+                                }}
+                                className={`p-1 border-r border-slate-200 align-top cursor-pointer transition-all ${
                                   isConflict
-                                    ? groupPalette
-                                      ? `${groupPalette.bg} border-2 border-amber-500 border-l-4 ${groupPalette.text}`
-                                      : 'bg-amber-50 border-2 border-amber-500'
-                                    : groupPalette
-                                    ? `${groupPalette.bg} border ${groupPalette.border} ${groupPalette.text} shadow-2xs`
-                                    : 'bg-slate-100/90 border border-slate-300 text-slate-900 hover:bg-slate-200/70'
-                                } ${
-                                  isGroupHighlighted
-                                    ? `ring-2 ${groupPalette?.ring || 'ring-amber-600'} scale-[1.03] shadow-sm`
+                                    ? 'bg-amber-50/60'
+                                    : d.isToday
+                                    ? 'bg-indigo-50/30'
                                     : ''
-                                } ${isDimmed ? 'opacity-45' : ''}`}
+                                }`}
                               >
-                                {/* Render 1 or 2 guests inside this bed cell */}
-                                <div className="space-y-1">
-                                  {cellGuests.map((g) => (
-                                    <div
-                                      key={g.id}
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        openReservationEditor(g);
-                                      }}
-                                      className="flex items-center justify-between gap-1 hover:opacity-80"
-                                    >
-                                      <span className="text-xs font-extrabold truncate">
-                                        {g.guest_name}
-                                      </span>
-                                      <span
-                                        className={`px-1 py-0.2 rounded text-[10px] font-bold shrink-0 ${
-                                          g.gender === 'M'
-                                            ? 'bg-sky-100 text-sky-800 border border-sky-200'
-                                            : 'bg-rose-100 text-rose-800 border border-rose-200'
-                                        }`}
+                                <div
+                                  className={`h-full min-h-[64px] rounded-lg p-1.5 flex flex-col justify-between transition-all ${
+                                    isConflict
+                                      ? groupPalette
+                                        ? `${groupPalette.bg} border-2 border-amber-500 border-l-4 ${groupPalette.text}`
+                                        : 'bg-amber-50 border-2 border-amber-500'
+                                      : groupPalette
+                                      ? `${groupPalette.bg} border ${groupPalette.border} ${groupPalette.text} shadow-2xs`
+                                      : isShabanaRoom
+                                      ? 'bg-purple-50/90 border border-purple-300 text-purple-950 hover:bg-purple-100/70'
+                                      : 'bg-slate-100/90 border border-slate-300 text-slate-900 hover:bg-slate-200/70'
+                                  } ${
+                                    isGroupHighlighted
+                                      ? `ring-2 ${
+                                          groupPalette?.ring || 'ring-amber-600'
+                                        } scale-[1.03] shadow-sm`
+                                      : ''
+                                  } ${isDimmed ? 'opacity-45' : ''}`}
+                                >
+                                  {/* Guests List inside Cell */}
+                                  <div className="space-y-1">
+                                    {cellGuests.map((g) => {
+                                      const stayNights = getReservationNights(
+                                        g.check_in,
+                                        g.check_out
+                                      );
+                                      const dayIdx = getCurrentStayDayIndex(
+                                        g.check_in,
+                                        d.dateStr
+                                      );
+                                      const totalGuestNights =
+                                        guestTotalNightsMap.get(
+                                          g.guest_name.trim().toLowerCase()
+                                        ) || stayNights;
+
+                                      return (
+                                        <div
+                                          key={g.id}
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            openReservationEditor(g);
+                                          }}
+                                          className="rounded bg-white/75 px-1 py-0.5 border border-black/5 hover:bg-white transition-colors"
+                                        >
+                                          <div className="flex items-center justify-between gap-1">
+                                            <span className="text-xs font-extrabold truncate">
+                                              {g.guest_name}
+                                            </span>
+                                            <span
+                                              className={`px-1 py-0.2 rounded text-[10px] font-bold shrink-0 ${
+                                                g.gender === 'M'
+                                                  ? 'bg-sky-100 text-sky-800 border border-sky-200'
+                                                  : 'bg-rose-100 text-rose-800 border border-rose-200'
+                                              }`}
+                                            >
+                                              {g.gender === 'M' ? '남' : '여'}
+                                            </span>
+                                          </div>
+                                          {/* Guest Stay Nights Badge */}
+                                          <div className="flex items-center justify-between gap-1 mt-0.5">
+                                            <span className="text-[10px] font-bold text-indigo-700">
+                                              🌙 {stayNights}박 ({dayIdx}/{stayNights}일차)
+                                            </span>
+                                            {totalGuestNights > stayNights && (
+                                              <span
+                                                className="text-[9px] font-extrabold text-amber-700 bg-amber-100 px-1 rounded"
+                                                title="동일 이름 게스트 전체 누적 숙박일수"
+                                              >
+                                                총{totalGuestNights}박
+                                              </span>
+                                            )}
+                                          </div>
+                                        </div>
+                                      );
+                                    })}
+
+                                    {/* Staff List in 샤바나 (no conflict, shown alongside guests) */}
+                                    {isShabanaRoom &&
+                                      cellStaffList.map((st) => (
+                                        <div
+                                          key={st.id}
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setStaffDateModal({
+                                              dateStr: d.dateStr,
+                                              initialStaffId: st.id,
+                                              defaultTarget: '샤바나',
+                                              targetBedId: bed.id,
+                                            });
+                                          }}
+                                          title={`${st.name} 스태프 샤바나 숙박 중 (클릭하여 이 날짜 숙박 변경/해제)`}
+                                          className="rounded bg-emerald-100/95 border border-emerald-400 px-1.5 py-0.5 flex items-center justify-between gap-1 hover:bg-emerald-200/80 transition-colors"
+                                        >
+                                          <span className="text-[11px] font-extrabold text-emerald-950 truncate">
+                                            ⛺ {st.name} (스태프)
+                                          </span>
+                                          <span
+                                            className={`px-1 rounded text-[9px] font-bold shrink-0 ${
+                                              st.gender === 'M'
+                                                ? 'bg-sky-100 text-sky-800'
+                                                : 'bg-rose-100 text-rose-800'
+                                            }`}
+                                          >
+                                            {st.gender === 'M' ? '남' : '여'}
+                                          </span>
+                                        </div>
+                                      ))}
+                                  </div>
+
+                                  {/* Group or Occupancy & Quick Add Badges */}
+                                  <div className="mt-1 space-y-1">
+                                    {!isShabanaRoom && cellGuests.length >= 2 && (
+                                      <div className="px-1.5 py-0.5 rounded bg-indigo-700 text-white text-[9px] font-extrabold truncate">
+                                        👫 1인실 2인 동반
+                                      </div>
+                                    )}
+
+                                    {primaryGuest?.group_code && groupPalette && (
+                                      <div
+                                        className={`px-1.5 py-0.5 rounded text-[9px] font-bold truncate flex items-center gap-0.5 ${groupPalette.badgeBg}`}
                                       >
-                                        {g.gender === 'M' ? '남' : '여'}
-                                      </span>
-                                    </div>
-                                  ))}
-                                </div>
-
-                                {/* Group or Occupancy Badge */}
-                                <div className="mt-1 space-y-1">
-                                  {cellGuests.length >= 2 && (
-                                    <div className="px-1.5 py-0.5 rounded bg-indigo-700 text-white text-[9px] font-extrabold truncate">
-                                      👫 1인실 2인 동반
-                                    </div>
-                                  )}
-
-                                  {primaryGuest.group_code && groupPalette ? (
-                                    <div
-                                      className={`px-1.5 py-0.5 rounded text-[9px] font-bold truncate flex items-center gap-0.5 ${groupPalette.badgeBg}`}
-                                    >
-                                      <span>
-                                        👥 일행 {groupCount}명 (
-                                        {primaryGuest.group_code.replace('GRP-', '')})
-                                      </span>
-                                    </div>
-                                  ) : (
-                                    cellGuests.length === 1 && (
-                                      <div className="flex items-center justify-between gap-1">
-                                        <span className="text-[10px] text-slate-500 font-medium">
-                                          개인 투숙
+                                        <span>
+                                          👥 일행 {groupCount}명 (
+                                          {primaryGuest.group_code.replace(
+                                            'GRP-',
+                                            ''
+                                          )}
+                                          )
                                         </span>
-                                        {maxCap > 1 && (
+                                      </div>
+                                    )}
+
+                                    {/* Unlimited add buttons for 샤바나 or 2nd guest button for 1인실 */}
+                                    {isShabanaRoom ? (
+                                      <div className="flex items-center justify-between gap-1 pt-0.5">
+                                        <button
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            onClickEmptyCell(bed.id, d.dateStr);
+                                          }}
+                                          className="flex-1 py-0.5 px-1 rounded bg-purple-600 hover:bg-purple-700 text-white text-[9px] font-bold text-center cursor-pointer"
+                                          title="샤바나에 게스트 추가 배정"
+                                        >
+                                          +게스트
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setStaffDateModal({
+                                              dateStr: d.dateStr,
+                                              defaultTarget: '샤바나',
+                                              targetBedId: bed.id,
+                                            });
+                                          }}
+                                          className="flex-1 py-0.5 px-1 rounded bg-emerald-600 hover:bg-emerald-700 text-white text-[9px] font-bold text-center cursor-pointer"
+                                          title="샤바나에 스태프 숙박 지정"
+                                        >
+                                          +스태프
+                                        </button>
+                                      </div>
+                                    ) : (
+                                      cellGuests.length === 1 &&
+                                      maxCap > 1 && (
+                                        <div className="flex items-center justify-end">
                                           <button
                                             type="button"
                                             onClick={(e) => {
                                               e.stopPropagation();
-                                              onClickEmptyCell(bed.id, d.dateStr);
+                                              onClickEmptyCell(
+                                                bed.id,
+                                                d.dateStr
+                                              );
                                             }}
                                             className="px-1 py-0.2 rounded bg-indigo-100 hover:bg-indigo-200 text-indigo-700 text-[9px] font-bold cursor-pointer"
                                             title="1인실에 2번째 동반 투숙객 추가"
                                           >
                                             +2인추가
                                           </button>
-                                        )}
+                                        </div>
+                                      )
+                                    )}
+
+                                    {isConflict && primaryStaff && (
+                                      <div
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setStaffDateModal({
+                                            dateStr: d.dateStr,
+                                            initialStaffId: primaryStaff.id,
+                                            defaultTarget: '침대',
+                                            targetBedId: bed.id,
+                                          });
+                                        }}
+                                        title="클릭하여 이 날짜의 스태프 취침 위치를 변경하거나 숙박 안 함 처리"
+                                        className="px-1 py-0.5 rounded bg-amber-500 hover:bg-amber-600 text-white text-[10px] font-extrabold flex items-center gap-0.5 justify-center animate-pulse cursor-pointer"
+                                      >
+                                        <AlertTriangle className="w-3 h-3 shrink-0" />
+                                        <span className="truncate">
+                                          ⚠️ {primaryStaff.name} 중복 (변경)
+                                        </span>
                                       </div>
-                                    )
-                                  )}
-
-                                  {isConflict && assignedStaff && (
-                                    <div className="px-1 py-0.5 rounded bg-amber-500 text-white text-[10px] font-extrabold flex items-center gap-0.5 justify-center animate-pulse">
-                                      <AlertTriangle className="w-3 h-3 shrink-0" />
-                                      <span className="truncate">
-                                        ⚠️ {assignedStaff.name} 중복
-                                      </span>
-                                    </div>
-                                  )}
+                                    )}
+                                  </div>
                                 </div>
-                              </div>
-                            </td>
-                          );
-                        }
+                              </td>
+                            );
+                          }
 
-                        // Case 3: Staff occupied (Green cell)
-                        if (assignedStaff) {
+                          // Case 3: Regular Bed occupied by Staff only (Green cell)
+                          if (primaryStaff) {
+                            const assignInfo = getStaffAssignmentForDate(
+                              primaryStaff,
+                              d.dateStr
+                            );
+                            return (
+                              <td
+                                key={d.dateStr}
+                                onClick={() =>
+                                  setStaffDateModal({
+                                    dateStr: d.dateStr,
+                                    initialStaffId: primaryStaff.id,
+                                    defaultTarget: '침대',
+                                    targetBedId: bed.id,
+                                  })
+                                }
+                                title={`${primaryStaff.name} 취침 중 (클릭하여 이 날짜 스태프 숙박 변경/숙박안함 설정 또는 게스트 예약 추가)`}
+                                className={`p-1 border-r border-slate-200 align-top cursor-pointer ${
+                                  d.isToday ? 'bg-emerald-50/40' : ''
+                                }`}
+                              >
+                                <div className="h-full min-h-[64px] rounded-lg p-1.5 bg-emerald-50 border border-emerald-400 text-emerald-950 hover:bg-emerald-100/80 transition-colors flex flex-col justify-between">
+                                  <div className="space-y-1">
+                                    {cellStaffList.map((st) => (
+                                      <div
+                                        key={st.id}
+                                        className="flex items-center justify-between gap-1"
+                                      >
+                                        <span className="text-xs font-extrabold text-emerald-900 truncate">
+                                          {st.name}
+                                        </span>
+                                        <span
+                                          className={`px-1 py-0.2 rounded text-[10px] font-bold shrink-0 ${
+                                            st.gender === 'M'
+                                              ? 'bg-sky-100 text-sky-800'
+                                              : 'bg-rose-100 text-rose-800'
+                                          }`}
+                                        >
+                                          {st.gender === 'M' ? '남' : '여'}
+                                        </span>
+                                      </div>
+                                    ))}
+                                  </div>
+
+                                  <div className="mt-1 flex items-center justify-between gap-1">
+                                    <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-emerald-600 text-white text-[9px] font-bold">
+                                      {assignInfo.isCustomDate
+                                        ? '📌 날짜지정'
+                                        : '상주 스태프'}
+                                    </span>
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        onClickEmptyCell(bed.id, d.dateStr);
+                                      }}
+                                      className="px-1 py-0.5 rounded bg-white/90 hover:bg-white text-emerald-800 border border-emerald-300 text-[9px] font-bold cursor-pointer"
+                                      title="이 침대에 게스트 예약 추가"
+                                    >
+                                      +게스트
+                                    </button>
+                                  </div>
+                                </div>
+                              </td>
+                            );
+                          }
+
+                          // Case 4: Empty Bed / Empty 샤바나 Cell
                           return (
                             <td
                               key={d.dateStr}
                               onClick={() => onClickEmptyCell(bed.id, d.dateStr)}
-                              title={`${assignedStaff.name} 취침 중 (클릭하여 게스트 예약 등록 시 충돌 경고가 표시됩니다)`}
-                              className={`p-1 border-r border-slate-200 align-top cursor-pointer ${
-                                d.isToday ? 'bg-emerald-50/40' : ''
+                              className={`p-1 border-r border-slate-200 align-middle cursor-pointer group/cell ${
+                                d.isToday
+                                  ? 'bg-indigo-50/20'
+                                  : isShabanaRoom
+                                  ? 'bg-purple-50/15'
+                                  : ''
                               }`}
                             >
-                              <div className="h-full min-h-[58px] rounded-lg p-1.5 bg-emerald-50 border border-emerald-400 text-emerald-950 hover:bg-emerald-100/80 transition-colors flex flex-col justify-between">
-                                <div className="flex items-center justify-between gap-1">
-                                  <span className="text-xs font-extrabold text-emerald-900 truncate">
-                                    {assignedStaff.name}
-                                  </span>
-                                  <span
-                                    className={`px-1 py-0.2 rounded text-[10px] font-bold shrink-0 ${
-                                      assignedStaff.gender === 'M'
-                                        ? 'bg-sky-100 text-sky-800'
-                                        : 'bg-rose-100 text-rose-800'
-                                    }`}
-                                  >
-                                    {assignedStaff.gender === 'M' ? '남' : '여'}
-                                  </span>
-                                </div>
-                                <div className="mt-1 inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-emerald-600 text-white text-[9px] font-bold w-fit">
-                                  상주 스태프
-                                </div>
+                              <div
+                                className={`h-full min-h-[64px] rounded-lg border border-dashed border-transparent flex flex-col items-center justify-center gap-1 transition-all ${
+                                  isShabanaRoom
+                                    ? 'group-hover/cell:border-purple-300 group-hover/cell:bg-purple-50/70'
+                                    : 'group-hover/cell:border-indigo-300 group-hover/cell:bg-indigo-50/50'
+                                }`}
+                              >
+                                <span
+                                  className={`opacity-0 group-hover/cell:opacity-100 text-[10px] font-bold flex items-center gap-0.5 ${
+                                    isShabanaRoom
+                                      ? 'text-purple-700'
+                                      : 'text-indigo-600'
+                                  }`}
+                                >
+                                  <Plus className="w-3 h-3" />
+                                  {isShabanaRoom ? '게스트 배정' : '예약'}
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setStaffDateModal({
+                                      dateStr: d.dateStr,
+                                      defaultTarget: isShabanaRoom
+                                        ? '샤바나'
+                                        : '침대',
+                                      targetBedId: bed.id,
+                                    });
+                                  }}
+                                  className="opacity-0 group-hover/cell:opacity-100 px-1.5 py-0.5 rounded bg-emerald-100 hover:bg-emerald-200 text-emerald-800 text-[9px] font-bold cursor-pointer"
+                                >
+                                  +스태프 지정
+                                </button>
                               </div>
                             </td>
                           );
-                        }
-
-                        // Case 4: Empty Bed Cell (Click to add reservation)
-                        return (
-                          <td
-                            key={d.dateStr}
-                            onClick={() => onClickEmptyCell(bed.id, d.dateStr)}
-                            className={`p-1 border-r border-slate-200 align-middle cursor-pointer group/cell ${
-                              d.isToday ? 'bg-indigo-50/20' : ''
-                            }`}
-                          >
-                            <div className="h-full min-h-[58px] rounded-lg border border-dashed border-transparent group-hover/cell:border-indigo-300 group-hover/cell:bg-indigo-50/50 flex items-center justify-center transition-all">
-                              <span className="opacity-0 group-hover/cell:opacity-100 text-[11px] font-semibold text-indigo-600 flex items-center gap-0.5">
-                                <Plus className="w-3.5 h-3.5" />
-                                예약
-                              </span>
-                            </div>
-                          </td>
-                        );
-                      })}
-                    </tr>
-                  ))}
-                </React.Fragment>
-              ))}
+                        })}
+                      </tr>
+                    ))}
+                  </React.Fragment>
+                );
+              })}
             </tbody>
 
             {/* Daily Total Sleeping Headcount Footer Row */}
@@ -684,7 +1076,7 @@ export default function BedMapCalendar({
                 >
                   <div>일별 총 취침 인원</div>
                   <div className="text-[10px] text-slate-400 font-normal">
-                    (게스트 + 내부 스태프)
+                    (게스트 + 숙박 스태프)
                   </div>
                 </td>
                 {dailyHeadcounts.map((hc, idx) => {
@@ -711,6 +1103,361 @@ export default function BedMapCalendar({
         </div>
       </div>
 
+      {/* Guest Stay Duration Calculator & Cumulative Summary Panel */}
+      <div className="bg-white rounded-2xl border border-slate-200 shadow-xs p-4 sm:p-5">
+        <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3 pb-3.5 border-b border-slate-100">
+          <div className="flex items-center gap-2.5">
+            <div className="w-8 h-8 rounded-lg bg-indigo-100 text-indigo-700 flex items-center justify-center">
+              <Calculator className="w-4 h-4" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <h3 className="text-base font-extrabold text-slate-900">
+                  📊 게스트별 숙박 일수(박수) 자동 계산 및 누적 현황
+                </h3>
+                <span className="px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200 text-xs font-bold">
+                  총 {guestStayStatsList.length}명 · 누적{' '}
+                  {guestStayStatsList.reduce((acc, g) => acc + g.totalNights, 0)}
+                  박
+                </span>
+              </div>
+              <p className="text-xs text-slate-500">
+                각 게스트의 예약별 숙박 일수와 연박·재방문 누적 숙박 일수, 현재 14일 캘린더 기간 내 숙박 일수를 자동으로 계산합니다.
+              </p>
+            </div>
+          </div>
+
+          {/* Search & Scope Filter */}
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="relative">
+              <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                placeholder="게스트 이름 검색..."
+                value={guestSearchQuery}
+                onChange={(e) => setGuestSearchQuery(e.target.value)}
+                className="pl-8 pr-3 py-1.5 rounded-xl border border-slate-200 bg-slate-50 text-xs font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:bg-white"
+              />
+            </div>
+
+            <div className="inline-flex rounded-xl border border-slate-200 bg-slate-50 p-0.5 text-xs">
+              {[
+                { key: 'ALL', label: `전체 (${guestStayStatsList.length})` },
+                {
+                  key: 'WINDOW',
+                  label: `표시된 14일 내 (${
+                    guestStayStatsList.filter((g) => g.windowNights > 0).length
+                  })`,
+                },
+                {
+                  key: 'TODAY',
+                  label: `오늘 투숙 (${
+                    guestStayStatsList.filter((g) => g.isStayingToday).length
+                  })`,
+                },
+              ].map((tab) => (
+                <button
+                  key={tab.key}
+                  type="button"
+                  onClick={() =>
+                    setGuestFilterScope(tab.key as 'ALL' | 'WINDOW' | 'TODAY')
+                  }
+                  className={`px-2.5 py-1 rounded-lg font-bold transition-colors cursor-pointer ${
+                    guestFilterScope === tab.key
+                      ? 'bg-indigo-600 text-white shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {filteredGuestStats.length === 0 ? (
+          <div className="py-8 text-center text-xs text-slate-500">
+            해당 조건에 일치하는 게스트 예약 내역이 없습니다.
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3 pt-4 max-h-[320px] overflow-y-auto pr-1">
+            {filteredGuestStats.map((stat) => (
+              <div
+                key={stat.guestName}
+                className="rounded-xl border border-slate-200 bg-slate-50/70 p-3 flex flex-col justify-between gap-2 hover:border-indigo-300 transition-colors"
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    <span className="text-sm font-extrabold text-slate-900 truncate">
+                      {stat.guestName}
+                    </span>
+                    <span
+                      className={`px-1.5 py-0.5 rounded text-[10px] font-bold shrink-0 ${
+                        stat.gender === 'M'
+                          ? 'bg-sky-100 text-sky-800'
+                          : 'bg-rose-100 text-rose-800'
+                      }`}
+                    >
+                      {stat.gender === 'M' ? '남' : '여'}
+                    </span>
+                    {stat.isStayingToday && (
+                      <span className="px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800 text-[10px] font-bold shrink-0">
+                        오늘투숙
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-1 shrink-0">
+                    <span className="px-2 py-0.5 rounded-lg bg-indigo-600 text-white text-xs font-extrabold flex items-center gap-1">
+                      <Moon className="w-3 h-3" />총 {stat.totalNights}박
+                    </span>
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between text-[11px] text-slate-600 font-semibold">
+                  <span>예약 {stat.reservations.length}건</span>
+                  <span>현재 14일 뷰 내: {stat.windowNights}박</span>
+                </div>
+
+                <div className="space-y-1 pt-1 border-t border-slate-200/80">
+                  {stat.reservations.map((r) => (
+                    <button
+                      key={r.id}
+                      type="button"
+                      onClick={() => openReservationEditor(r)}
+                      className="w-full text-left px-2 py-1 rounded-lg bg-white hover:bg-indigo-50 border border-slate-200 text-[11px] flex items-center justify-between gap-1 transition-colors cursor-pointer"
+                    >
+                      <span className="font-bold text-slate-800 truncate">
+                        {r.bedLabel} · {r.check_in.slice(5)}~{r.check_out.slice(5)}
+                      </span>
+                      <span className="font-extrabold text-indigo-700 shrink-0">
+                        {r.nights}박 ({r.nights + 1}일)
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Quick Staff Per-Date Accommodation Modal */}
+      {staffDateModal && (
+        <div
+          className="fixed inset-0 z-50 bg-slate-900/55 backdrop-blur-xs flex items-center justify-center p-4"
+          onClick={() => setStaffDateModal(null)}
+        >
+          <div
+            className="bg-white rounded-2xl border border-slate-200 shadow-2xl max-w-lg w-full overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-5 py-4 bg-emerald-900 text-white flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <UserCheck className="w-4 h-4 text-emerald-300" />
+                <div>
+                  <h3 className="text-sm sm:text-base font-extrabold">
+                    📅 {staffDateModal.dateStr} 스태프 날짜별 숙박 지정
+                  </h3>
+                  <p className="text-[11px] text-emerald-200">
+                    해당 날짜에만 적용할 스태프 취침 위치(침대 / 샤바나 / 거실 / 사장님방 / 숙박 안 함)를 선택하세요.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setStaffDateModal(null)}
+                className="p-1 rounded-lg text-emerald-200 hover:text-white hover:bg-emerald-800 cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4 max-h-[75vh] overflow-y-auto">
+              {staff.length === 0 ? (
+                <p className="text-xs text-slate-500 text-center py-4">
+                  등록된 스태프가 없습니다. 아래 스태프 관리에서 스태프를 먼저 추가해 주세요.
+                </p>
+              ) : (
+                staff.map((s) => {
+                  const assign = getStaffAssignmentForDate(
+                    s,
+                    staffDateModal.dateStr
+                  );
+                  const assignedBedObj =
+                    assign.bed_id !== null
+                      ? beds.find((b) => b.id === assign.bed_id)
+                      : null;
+                  const currentLabel =
+                    assign.location_note === '외박'
+                      ? '🚫 숙박 안 함 (외박)'
+                      : assign.location_note === '샤바나'
+                      ? '⛺ 샤바나'
+                      : assignedBedObj
+                      ? `🛏️ ${formatBedCode(assignedBedObj)} 침대`
+                      : `🏠 ${assign.location_note}`;
+
+                  return (
+                    <div
+                      key={s.id}
+                      className={`p-3.5 rounded-xl border space-y-2.5 ${
+                        staffDateModal.initialStaffId === s.id
+                          ? 'border-emerald-500 bg-emerald-50/50 ring-1 ring-emerald-400'
+                          : 'border-slate-200 bg-slate-50/70'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <span className="font-extrabold text-sm text-slate-900">
+                            {s.name}
+                          </span>
+                          <span
+                            className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                              s.gender === 'M'
+                                ? 'bg-sky-100 text-sky-800'
+                                : 'bg-rose-100 text-rose-800'
+                            }`}
+                          >
+                            {s.gender === 'M' ? '남' : '여'}
+                          </span>
+                        </div>
+                        <span className="px-2.5 py-0.5 rounded-full bg-white border border-slate-300 text-xs font-bold text-slate-800">
+                          현재: {currentLabel}
+                        </span>
+                      </div>
+
+                      {/* Quick Non-Bed / Shabana / No-Stay Buttons */}
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            await onChangeStaffDateLocation(
+                              s,
+                              [staffDateModal.dateStr],
+                              null,
+                              '외박'
+                            );
+                            setStaffDateModal(null);
+                          }}
+                          className={`py-1.5 px-2 rounded-lg border text-xs font-bold transition-colors cursor-pointer ${
+                            assign.location_note === '외박'
+                              ? 'bg-slate-800 text-white border-slate-800'
+                              : 'bg-white hover:bg-slate-100 text-rose-700 border-rose-200'
+                          }`}
+                        >
+                          🚫 숙박 안 함
+                        </button>
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            const shabana = beds.find(
+                              (b) => b.room_name === '샤바나'
+                            );
+                            await onChangeStaffDateLocation(
+                              s,
+                              [staffDateModal.dateStr],
+                              shabana ? shabana.id : null,
+                              '샤바나'
+                            );
+                            setStaffDateModal(null);
+                          }}
+                          className={`py-1.5 px-2 rounded-lg border text-xs font-bold transition-colors cursor-pointer ${
+                            assign.location_note === '샤바나'
+                              ? 'bg-purple-600 text-white border-purple-600'
+                              : 'bg-purple-50 hover:bg-purple-100 text-purple-900 border-purple-200'
+                          }`}
+                        >
+                          ⛺ 샤바나
+                        </button>
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            await onChangeStaffDateLocation(
+                              s,
+                              [staffDateModal.dateStr],
+                              null,
+                              '거실'
+                            );
+                            setStaffDateModal(null);
+                          }}
+                          className={`py-1.5 px-2 rounded-lg border text-xs font-bold transition-colors cursor-pointer ${
+                            assign.location_note === '거실'
+                              ? 'bg-indigo-600 text-white border-indigo-600'
+                              : 'bg-white hover:bg-slate-100 text-slate-700 border-slate-200'
+                          }`}
+                        >
+                          🛋️ 거실
+                        </button>
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            await onChangeStaffDateLocation(
+                              s,
+                              [staffDateModal.dateStr],
+                              null,
+                              '사장님방'
+                            );
+                            setStaffDateModal(null);
+                          }}
+                          className={`py-1.5 px-2 rounded-lg border text-xs font-bold transition-colors cursor-pointer ${
+                            assign.location_note === '사장님방'
+                              ? 'bg-indigo-600 text-white border-indigo-600'
+                              : 'bg-white hover:bg-slate-100 text-slate-700 border-slate-200'
+                          }`}
+                        >
+                          🏠 사장님방
+                        </button>
+                      </div>
+
+                      {/* 12 Regular Beds Grid for this date */}
+                      <div className="grid grid-cols-6 gap-1">
+                        {beds
+                          .filter((b) => b.room_name !== '샤바나')
+                          .map((b) => {
+                            const isSelectedBed =
+                              assign.location_note === '침대' &&
+                              assign.bed_id === b.id;
+                            const hasGuestOnDate = reservations.some(
+                              (r) =>
+                                r.bed_id === b.id &&
+                                r.check_in <= staffDateModal.dateStr &&
+                                staffDateModal.dateStr < r.check_out
+                            );
+                            return (
+                              <button
+                                key={b.id}
+                                type="button"
+                                onClick={async () => {
+                                  await onChangeStaffDateLocation(
+                                    s,
+                                    [staffDateModal.dateStr],
+                                    b.id,
+                                    '침대'
+                                  );
+                                  setStaffDateModal(null);
+                                }}
+                                className={`py-1 px-1.5 rounded border text-[11px] font-bold transition-colors cursor-pointer ${
+                                  isSelectedBed
+                                    ? 'bg-emerald-600 text-white border-emerald-600'
+                                    : hasGuestOnDate
+                                    ? 'bg-amber-50 text-amber-900 border-amber-200 hover:bg-amber-100'
+                                    : 'bg-white text-slate-700 border-slate-200 hover:bg-emerald-50'
+                                }`}
+                              >
+                                {formatBedCode(b)}
+                              </button>
+                            );
+                          })}
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Selected Reservation Detail / Edit / Delete Modal */}
       {selectedReservation && (
         <div
@@ -725,7 +1472,7 @@ export default function BedMapCalendar({
               <div className="flex items-center gap-2">
                 <Pencil className="w-4 h-4 text-indigo-300" />
                 <span className="text-base font-extrabold">
-                  예약 상세 조회 및 수정
+                  예약 상세 조회 · 숙박일수 계산 · 수정
                 </span>
               </div>
               <button
@@ -746,14 +1493,25 @@ export default function BedMapCalendar({
                   setEditError('투숙객 이름을 입력해 주세요.');
                   return;
                 }
-                if (!editCheckIn || !editCheckOut || editCheckOut <= editCheckIn) {
-                  setEditError('체크아웃 날짜는 체크인 날짜보다 이후여야 합니다.');
+                if (
+                  !editCheckIn ||
+                  !editCheckOut ||
+                  editCheckOut <= editCheckIn
+                ) {
+                  setEditError(
+                    '체크아웃 날짜는 체크인 날짜보다 이후여야 합니다.'
+                  );
                   return;
                 }
 
                 // Check bed capacity against other reservations overlapping [editCheckIn, editCheckOut)
-                const targetBedObj = beds.find((b) => b.id === Number(editBedId));
-                const maxCap = targetBedObj ? getBedMaxCapacity(targetBedObj) : 1;
+                const targetBedObj = beds.find(
+                  (b) => b.id === Number(editBedId)
+                );
+                const isTargetShabana = targetBedObj?.room_name === '샤바나';
+                const maxCap = targetBedObj
+                  ? getBedMaxCapacity(targetBedObj)
+                  : 1;
                 const overlappingOthers = reservations.filter(
                   (r) =>
                     r.id !== selectedReservation.id &&
@@ -762,7 +1520,7 @@ export default function BedMapCalendar({
                     r.check_out > editCheckIn
                 );
 
-                if (overlappingOthers.length >= maxCap) {
+                if (!isTargetShabana && overlappingOthers.length >= maxCap) {
                   const bedLabel = targetBedObj
                     ? formatBedCode(targetBedObj)
                     : `#${editBedId}`;
@@ -797,6 +1555,48 @@ export default function BedMapCalendar({
               }}
               className="p-5 space-y-4 text-sm"
             >
+              {/* Stay Duration Summary Banner */}
+              <div className="p-3.5 rounded-xl bg-indigo-50 border border-indigo-200 flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <div className="text-[11px] font-bold text-indigo-700">
+                    🌙 게스트 숙박 일수 자동 계산
+                  </div>
+                  <div className="text-base font-extrabold text-indigo-950 mt-0.5">
+                    이번 예약: {editNightsCount}박 ({editNightsCount + 1}일)
+                    {editGuestOtherReservationsNights > 0 && (
+                      <span className="ml-2 text-xs font-bold text-amber-800 bg-amber-100 px-2 py-0.5 rounded-full">
+                        다른 예약 +{editGuestOtherReservationsNights}박 = 총 누적{' '}
+                        {editNightsCount + editGuestOtherReservationsNights}박
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <div className="flex items-center gap-1">
+                  {[1, 2, 3, 4, 5].map((n) => (
+                    <button
+                      key={n}
+                      type="button"
+                      onClick={() => {
+                        if (!editCheckIn) return;
+                        setEditCheckOut(
+                          format(
+                            addDays(parseISO(editCheckIn), n),
+                            'yyyy-MM-dd'
+                          )
+                        );
+                      }}
+                      className={`px-2 py-1 rounded-lg text-xs font-bold border transition-colors cursor-pointer ${
+                        editNightsCount === n
+                          ? 'bg-indigo-600 text-white border-indigo-600'
+                          : 'bg-white text-slate-700 border-slate-300 hover:bg-indigo-100'
+                      }`}
+                    >
+                      {n}박
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               {/* Name & Gender */}
               <div className="grid grid-cols-1 sm:grid-cols-12 gap-3">
                 <div className="sm:col-span-7">
@@ -839,7 +1639,7 @@ export default function BedMapCalendar({
               {/* Bed Selection */}
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1">
-                  배정 침대 변경
+                  배정 침대 / 공간 변경 (샤바나 다인 배정 가능)
                 </label>
                 <select
                   value={editBedId}
@@ -847,6 +1647,7 @@ export default function BedMapCalendar({
                   className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-bold text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500"
                 >
                   {beds.map((b) => {
+                    const isShabana = b.room_name === '샤바나';
                     const maxCap = getBedMaxCapacity(b);
                     const otherGuests = reservations.filter(
                       (r) =>
@@ -855,31 +1656,32 @@ export default function BedMapCalendar({
                         r.check_in < editCheckOut &&
                         r.check_out > editCheckIn
                     );
-                    const isFull = otherGuests.length >= maxCap;
-                    const staffOnBed = staff.find(
-                      (s) =>
-                        s.current_bed_id === b.id &&
-                        s.check_in < editCheckOut &&
-                        s.check_out > editCheckIn
-                    );
+                    const isFull = !isShabana && otherGuests.length >= maxCap;
 
                     let suffix = ' (이동 가능)';
                     if (b.id === selectedReservation.bed_id) {
-                      suffix = ' (현재 배정 침대)';
+                      suffix = ' (현재 배정)';
+                    } else if (isShabana) {
+                      suffix =
+                        otherGuests.length > 0
+                          ? ` (인원 무제한 · 현재 ${otherGuests.length}명 예약됨)`
+                          : ' (인원 무제한 · 이동 가능)';
                     } else if (isFull) {
                       suffix = ` (❌ ${otherGuests
                         .map((o) => o.guest_name)
                         .join(', ')} 투숙 중)`;
                     } else if (otherGuests.length > 0) {
                       suffix = ` (👫 ${otherGuests[0].guest_name} 외 1인 동반 가능)`;
-                    } else if (staffOnBed) {
-                      suffix = ` (⚠️ ${staffOnBed.name} 배정 침대)`;
                     }
 
                     return (
                       <option key={b.id} value={b.id} disabled={isFull}>
-                        {formatBedCode(b)} ({b.room_name}
-                        {maxCap > 1 ? '·최대2인' : ''}){suffix}
+                        {isShabana
+                          ? '샤바나 (인원 무제한)'
+                          : `${formatBedCode(b)} (${b.room_name}${
+                              maxCap > 1 ? '·최대2인' : ''
+                            })`}
+                        {suffix}
                       </option>
                     );
                   })}
@@ -910,14 +1712,17 @@ export default function BedMapCalendar({
                 </div>
                 <div>
                   <label className="block text-xs font-bold text-slate-700 mb-1">
-                    체크아웃 (Check-Out)
+                    체크아웃 (Check-Out · {editNightsCount}박)
                   </label>
                   <input
                     type="date"
                     value={editCheckOut}
                     min={
                       editCheckIn
-                        ? format(addDays(parseISO(editCheckIn), 1), 'yyyy-MM-dd')
+                        ? format(
+                            addDays(parseISO(editCheckIn), 1),
+                            'yyyy-MM-dd'
+                          )
                         : undefined
                     }
                     onChange={(e) => setEditCheckOut(e.target.value)}
@@ -1006,8 +1811,15 @@ export default function BedMapCalendar({
                           (r) => r.group_code === selectedReservation.group_code
                         )
                         .map((companion) => {
-                          const cb = beds.find((x) => x.id === companion.bed_id);
-                          const isSelf = companion.id === selectedReservation.id;
+                          const cb = beds.find(
+                            (x) => x.id === companion.bed_id
+                          );
+                          const compNights = getReservationNights(
+                            companion.check_in,
+                            companion.check_out
+                          );
+                          const isSelf =
+                            companion.id === selectedReservation.id;
                           return (
                             <button
                               key={companion.id}
@@ -1021,7 +1833,7 @@ export default function BedMapCalendar({
                             >
                               {companion.guest_name} (
                               {companion.gender === 'M' ? '남' : '여'} ·{' '}
-                              {cb ? formatBedCode(cb) : ''})
+                              {cb ? formatBedCode(cb) : ''} · {compNights}박)
                             </button>
                           );
                         })}

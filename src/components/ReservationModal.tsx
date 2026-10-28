@@ -16,6 +16,8 @@ import {
   autoAssignEmptyBeds,
   formatBedCode,
   getBedMaxCapacity,
+  getReservationNights,
+  getStaffAssignmentForDate,
 } from '@/lib/supabase';
 import {
   Bed,
@@ -110,22 +112,30 @@ export default function ReservationModal({
     return map;
   }, [reservations, checkIn, checkOut]);
 
+  const nightsCount = useMemo(
+    () => getReservationNights(checkIn, checkOut),
+    [checkIn, checkOut]
+  );
+
   // Determine which beds are currently assigned to a staff member overlapping [checkIn, checkOut)
   const occupiedBedsByStaffMap = useMemo(() => {
     const map = new Map<number, string>();
     if (!checkIn || !checkOut || checkOut <= checkIn) return map;
 
+    const stayDates = Array.from({ length: Math.min(nightsCount, 60) }, (_, i) =>
+      format(addDays(parseISO(checkIn), i), 'yyyy-MM-dd')
+    );
+
     staff.forEach((s) => {
-      if (
-        s.current_bed_id !== null &&
-        s.check_in < checkOut &&
-        s.check_out > checkIn
-      ) {
-        map.set(s.current_bed_id, s.name);
-      }
+      stayDates.forEach((dStr) => {
+        const assign = getStaffAssignmentForDate(s, dStr);
+        if (assign.bed_id !== null && assign.location_note === '침대') {
+          map.set(assign.bed_id, s.name);
+        }
+      });
     });
     return map;
-  }, [staff, checkIn, checkOut]);
+  }, [staff, checkIn, checkOut, nightsCount]);
 
   if (!isOpen) return null;
 
@@ -309,42 +319,79 @@ export default function ReservationModal({
         </div>
 
         <form onSubmit={handleSubmit} className="p-6 space-y-5">
-          {/* Stay Dates */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 bg-slate-50 p-4 rounded-xl border border-slate-200">
-            <div>
-              <label className="block text-xs font-bold text-slate-700 mb-1">
-                체크인 날짜 (Check-In)
-              </label>
-              <input
-                type="date"
-                value={checkIn}
-                onChange={(e) => {
-                  const val = e.target.value;
-                  setCheckIn(val);
-                  if (val && checkOut <= val) {
-                    setCheckOut(format(addDays(parseISO(val), 1), 'yyyy-MM-dd'));
+          {/* Stay Dates & Nights Calculation */}
+          <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 space-y-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1">
+                  체크인 날짜 (Check-In)
+                </label>
+                <input
+                  type="date"
+                  value={checkIn}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setCheckIn(val);
+                    if (val && checkOut <= val) {
+                      setCheckOut(format(addDays(parseISO(val), 1), 'yyyy-MM-dd'));
+                    }
+                  }}
+                  className="w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  required
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1">
+                  체크아웃 날짜 (Check-Out)
+                </label>
+                <input
+                  type="date"
+                  value={checkOut}
+                  min={
+                    checkIn
+                      ? format(addDays(parseISO(checkIn), 1), 'yyyy-MM-dd')
+                      : undefined
                   }
-                }}
-                className="w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                required
-              />
+                  onChange={(e) => setCheckOut(e.target.value)}
+                  className="w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  required
+                />
+              </div>
             </div>
-            <div>
-              <label className="block text-xs font-bold text-slate-700 mb-1">
-                체크아웃 날짜 (Check-Out)
-              </label>
-              <input
-                type="date"
-                value={checkOut}
-                min={
-                  checkIn
-                    ? format(addDays(parseISO(checkIn), 1), 'yyyy-MM-dd')
-                    : undefined
-                }
-                onChange={(e) => setCheckOut(e.target.value)}
-                className="w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                required
-              />
+
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-200/80">
+              <div className="flex items-center gap-2">
+                <span className="px-2.5 py-1 rounded-lg bg-indigo-600 text-white text-xs font-extrabold">
+                  🌙 숙박 일수: {nightsCount}박 ({nightsCount + 1}일)
+                </span>
+                {guests.length > 1 && (
+                  <span className="text-xs font-bold text-slate-600">
+                    · 일행 {guests.length}명 합산 총 {nightsCount * guests.length}박
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-1">
+                <span className="text-[11px] font-semibold text-slate-500 mr-1">
+                  빠른 박수 지정:
+                </span>
+                {[1, 2, 3, 4, 5, 7].map((n) => (
+                  <button
+                    key={n}
+                    type="button"
+                    onClick={() => {
+                      if (!checkIn) return;
+                      setCheckOut(format(addDays(parseISO(checkIn), n), 'yyyy-MM-dd'));
+                    }}
+                    className={`px-2 py-1 rounded-lg text-xs font-bold border transition-colors cursor-pointer ${
+                      nightsCount === n
+                        ? 'bg-indigo-600 text-white border-indigo-600'
+                        : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-100'
+                    }`}
+                  >
+                    {n}박
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
 
@@ -389,9 +436,26 @@ export default function ReservationModal({
           {/* Guests List */}
           <div className="space-y-3 max-h-[340px] overflow-y-auto pr-1">
             {guests.map((guest, index) => {
-              const staffOnSelectedBed = occupiedBedsByStaffMap.get(
-                Number(guest.bed_id)
+              const selectedBedObj = beds.find(
+                (b) => b.id === Number(guest.bed_id)
               );
+              const staffOnSelectedBed =
+                selectedBedObj?.room_name === '샤바나'
+                  ? undefined
+                  : occupiedBedsByStaffMap.get(Number(guest.bed_id));
+
+              const existingGuestNights = guest.guest_name.trim()
+                ? reservations
+                    .filter(
+                      (r) =>
+                        r.guest_name.trim().toLowerCase() ===
+                        guest.guest_name.trim().toLowerCase()
+                    )
+                    .reduce(
+                      (acc, r) => acc + getReservationNights(r.check_in, r.check_out),
+                      0
+                    )
+                : 0;
 
               return (
                 <div
@@ -401,9 +465,18 @@ export default function ReservationModal({
                   <div className="grid grid-cols-1 sm:grid-cols-12 gap-3 items-end">
                     {/* Guest Name */}
                     <div className="sm:col-span-4">
-                      <label className="block text-[11px] font-bold text-slate-600 mb-1">
-                        투숙객 {index + 1} 성함
-                      </label>
+                      <div className="flex items-center justify-between mb-1">
+                        <label className="block text-[11px] font-bold text-slate-600">
+                          투숙객 {index + 1} 성함
+                        </label>
+                        <span className="text-[10px] font-bold text-indigo-600">
+                          {existingGuestNights > 0
+                            ? `기존 ${existingGuestNights}박 + 이번 ${nightsCount}박 = 총 ${
+                                existingGuestNights + nightsCount
+                              }박`
+                            : `${nightsCount}박`}
+                        </span>
+                      </div>
                       <input
                         type="text"
                         placeholder="예: 홍길동"
@@ -451,7 +524,7 @@ export default function ReservationModal({
                     {/* Bed Select */}
                     <div className="sm:col-span-4">
                       <label className="block text-[11px] font-bold text-slate-600 mb-1">
-                        배정 침대 (혼숙 도미토리/객실)
+                        배정 침대 (혼숙 도미토리/객실/샤바나)
                       </label>
                       <select
                         value={guest.bed_id}
@@ -463,6 +536,7 @@ export default function ReservationModal({
                         className="w-full rounded-lg border border-slate-300 bg-white px-2.5 py-2 text-xs font-bold text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500"
                       >
                         {beds.map((b) => {
+                          const isShabana = b.room_name === '샤바나';
                           const maxCap = getBedMaxCapacity(b);
                           const guestOccupyingList =
                             occupiedBedsByGuestMap.get(b.id) || [];
@@ -473,10 +547,15 @@ export default function ReservationModal({
                           ).length;
 
                           const isFullByExisting =
-                            guestOccupyingList.length >= maxCap;
+                            !isShabana && guestOccupyingList.length >= maxCap;
 
                           let statusSuffix = ' (예약 가능)';
-                          if (isFullByExisting) {
+                          if (isShabana) {
+                            statusSuffix =
+                              guestOccupyingList.length > 0
+                                ? ` (인원 무제한 · 현재 ${guestOccupyingList.length}명 예약됨)`
+                                : ' (인원 무제한 · 다인 배정 가능)';
+                          } else if (isFullByExisting) {
                             statusSuffix = ` (❌ ${guestOccupyingList.join(', ')} 예약됨)`;
                           } else if (guestOccupyingList.length > 0) {
                             statusSuffix = ` (👫 ${guestOccupyingList.join(', ')} 외 1인 추가 가능)`;
@@ -495,8 +574,11 @@ export default function ReservationModal({
                               value={b.id}
                               disabled={isFullByExisting}
                             >
-                              {formatBedCode(b)} ({b.room_name}
-                              {maxCap > 1 ? '·2인가능' : ''})
+                              {isShabana
+                                ? '샤바나 (인원 무제한)'
+                                : `${formatBedCode(b)} (${b.room_name}${
+                                    maxCap > 1 ? '·2인가능' : ''
+                                  })`}
                               {statusSuffix}
                             </option>
                           );

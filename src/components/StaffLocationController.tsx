@@ -2,21 +2,28 @@
 
 import React, { useState } from 'react';
 import { addDays, format, parseISO } from 'date-fns';
+import { ko } from 'date-fns/locale';
 import {
   AlertTriangle,
   Bed as BedIcon,
+  Calendar,
   Check,
   CheckCircle2,
   DoorOpen,
   Home,
   Pencil,
+  RotateCcw,
   Sparkles,
   Trash2,
   UserCheck,
   UserPlus,
   X,
 } from 'lucide-react';
-import { formatBedCode } from '@/lib/supabase';
+import {
+  formatBedCode,
+  getStaffAssignmentForDate,
+  isStaffSleepingInside,
+} from '@/lib/supabase';
 import {
   Bed,
   CreateStaffPayload,
@@ -39,6 +46,12 @@ interface StaffLocationControllerProps {
     bedId: number | null,
     locationNote: StaffLocationNote
   ) => void;
+  onChangeStaffDateLocation: (
+    staffMember: Staff,
+    dates: string[],
+    bedId: number | null,
+    locationNote: StaffLocationNote | null
+  ) => Promise<void>;
   onUpdateStaffProfile: (payload: UpdateStaffProfilePayload) => Promise<void>;
   onCreateStaff: (payload: CreateStaffPayload) => Promise<void>;
   onDeleteStaff: (staffId: string) => Promise<void>;
@@ -49,10 +62,10 @@ const NON_BED_LOCATIONS: {
   label: string;
   desc: string;
 }[] = [
-  { note: '거실', label: '거실', desc: '내부 취침 (인원 포함)' },
-  { note: '사장님방', label: '사장님방', desc: '내부 취침 (인원 포함)' },
-  { note: '샤바나', label: '샤바나', desc: '내부 취침 (인원 포함)' },
-  { note: '외박', label: '외박', desc: '외부 취침 (인원 제외)' },
+  { note: '샤바나', label: '⛺ 샤바나', desc: '베드맵 샤바나 칸 배정' },
+  { note: '거실', label: '🛋️ 거실', desc: '내부 취침 (인원 포함)' },
+  { note: '사장님방', label: '🏠 사장님방', desc: '내부 취침 (인원 포함)' },
+  { note: '외박', label: '🚫 숙박 안 함 (외박)', desc: '숙박 제외 (인원 제외)' },
 ];
 
 export default function StaffLocationController({
@@ -63,6 +76,7 @@ export default function StaffLocationController({
   dateStrings,
   updatingStaffId,
   onChangeStaffLocation,
+  onChangeStaffDateLocation,
   onUpdateStaffProfile,
   onCreateStaff,
   onDeleteStaff,
@@ -73,6 +87,11 @@ export default function StaffLocationController({
   const [editCheckIn, setEditCheckIn] = useState<string>('');
   const [editCheckOut, setEditCheckOut] = useState<string>('');
   const [savingProfile, setSavingProfile] = useState<boolean>(false);
+
+  // Selected dates per staff for batch per-date assignment: Record<staffId, string[]>
+  const [selectedDatesByStaff, setSelectedDatesByStaff] = useState<
+    Record<string, string[]>
+  >({});
 
   // Add new staff inline state
   const [isAddingStaff, setIsAddingStaff] = useState<boolean>(false);
@@ -85,6 +104,23 @@ export default function StaffLocationController({
   const [newStaffLocation, setNewStaffLocation] =
     useState<StaffLocationNote>('샤바나');
   const [creatingStaff, setCreatingStaff] = useState<boolean>(false);
+
+  const regularBeds = beds.filter((b) => b.room_name !== '샤바나');
+  const shabanaBed = beds.find((b) => b.room_name === '샤바나');
+
+  const toggleDateSelection = (staffId: string, dStr: string) => {
+    setSelectedDatesByStaff((prev) => {
+      const current = prev[staffId] || [];
+      const next = current.includes(dStr)
+        ? current.filter((x) => x !== dStr)
+        : [...current, dStr];
+      return { ...prev, [staffId]: next };
+    });
+  };
+
+  const clearDateSelection = (staffId: string) => {
+    setSelectedDatesByStaff((prev) => ({ ...prev, [staffId]: [] }));
+  };
 
   const startEditingStaff = (member: Staff) => {
     setEditingStaffId(member.id);
@@ -122,7 +158,8 @@ export default function StaffLocationController({
         gender: newStaffGender,
         check_in: newStaffCheckIn,
         check_out: newStaffCheckOut,
-        current_bed_id: null,
+        current_bed_id:
+          newStaffLocation === '샤바나' && shabanaBed ? shabanaBed.id : null,
         location_note: newStaffLocation,
       });
       setNewStaffName('');
@@ -138,43 +175,52 @@ export default function StaffLocationController({
     return found ? formatBedCode(found) : `침대 #${bedId}`;
   };
 
-  // Helper: check if a staff member has a conflict on their current_bed_id within the visible 14-day window
+  // Helper: check if a staff member has a conflict on any regular bed within the visible 14-day window
   const getStaffConflicts = (staffMember: Staff) => {
-    if (staffMember.current_bed_id === null) return [];
-    const conflicts: { dateStr: string; guestName: string }[] = [];
+    const conflicts: { dateStr: string; guestName: string; bedLabel: string }[] =
+      [];
 
     for (const dStr of dateStrings) {
-      const staffActive =
-        staffMember.check_in <= dStr && dStr < staffMember.check_out;
-      if (!staffActive) continue;
+      const assign = getStaffAssignmentForDate(staffMember, dStr);
+      if (assign.bed_id === null || assign.location_note !== '침대') continue;
+      const bedObj = beds.find((b) => b.id === assign.bed_id);
+      if (bedObj?.room_name === '샤바나') continue;
 
       const overlappingGuest = reservations.find(
         (r) =>
-          r.bed_id === staffMember.current_bed_id &&
+          r.bed_id === assign.bed_id &&
           r.check_in <= dStr &&
           dStr < r.check_out
       );
       if (overlappingGuest) {
-        conflicts.push({ dateStr: dStr, guestName: overlappingGuest.guest_name });
+        conflicts.push({
+          dateStr: dStr,
+          guestName: overlappingGuest.guest_name,
+          bedLabel: bedObj ? formatBedCode(bedObj) : `#${assign.bed_id}`,
+        });
       }
     }
     return conflicts;
   };
 
-  // Helper: check if a bed has any guest reservation today or in the 14-day window for this staff member
-  const getBedStatusForStaff = (bed: Bed, currentStaff: Staff) => {
+  // Helper: check if a regular bed has any guest reservation in the target dates for this staff member
+  const getBedStatusForStaff = (
+    bed: Bed,
+    currentStaff: Staff,
+    targetDates: string[]
+  ) => {
+    const checkDates = targetDates.length > 0 ? targetDates : dateStrings;
+
     const occupiedByOtherStaff = staff.some(
-      (s) => s.id !== currentStaff.id && s.current_bed_id === bed.id
+      (s) =>
+        s.id !== currentStaff.id &&
+        checkDates.some((dStr) => {
+          const a = getStaffAssignmentForDate(s, dStr);
+          return a.location_note === '침대' && a.bed_id === bed.id;
+        })
     );
 
-    const occupiedTonightByGuest = reservations.some(
-      (r) => r.bed_id === bed.id && r.check_in <= todayStr && todayStr < r.check_out
-    );
-
-    const hasConflictInWindow = dateStrings.some((dStr) => {
-      const staffActive =
-        currentStaff.check_in <= dStr && dStr < currentStaff.check_out;
-      if (!staffActive) return false;
+    const hasConflictInWindow = checkDates.some((dStr) => {
       return reservations.some(
         (r) => r.bed_id === bed.id && r.check_in <= dStr && dStr < r.check_out
       );
@@ -182,7 +228,6 @@ export default function StaffLocationController({
 
     return {
       occupiedByOtherStaff,
-      occupiedTonightByGuest,
       hasConflictInWindow,
     };
   };
@@ -196,28 +241,25 @@ export default function StaffLocationController({
               <UserCheck className="w-4 h-4" />
             </div>
             <div>
-              <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
-                상주 스태프 자리 배정 &amp; 인원 관리 ({staff.length}명)
+              <h2 className="text-base font-bold text-slate-900 flex items-center gap-2 flex-wrap">
+                <span>
+                  상주 스태프 자리 배정 &amp; 날짜별 숙박 스케줄러 ({staff.length}명)
+                </span>
+                <span className="px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-800 border border-emerald-200 text-[11px] font-bold">
+                  날짜별 개별 숙박 지정 · 숙박 안 함(외박) · 샤바나 배정 지원
+                </span>
               </h2>
               <p className="text-xs text-slate-500">
-                스태프 추가·삭제 및 이름·성별 설정이 가능하며, 취침 위치를 침대 또는{' '}
-                <strong className="text-slate-700">거실 · 사장님방 · 샤바나 · 외박</strong>으로 원클릭 전환하세요.
+                아래 14일 날짜별 스케줄 표에서 날짜마다{' '}
+                <strong className="text-slate-700">
+                  침대 / 샤바나 / 거실 / 사장님방 / 숙박 안 함(외박)
+                </strong>
+                을 각각 지정하거나 여러 날짜를 선택해 일괄 변경할 수 있습니다.
               </p>
             </div>
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
-            <div className="hidden md:flex items-center gap-3 text-xs text-slate-500">
-              <span className="inline-flex items-center gap-1">
-                <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 inline-block" />
-                14일간 비어있는 추천 침대
-              </span>
-              <span className="inline-flex items-center gap-1">
-                <span className="w-2.5 h-2.5 rounded-full bg-amber-400 inline-block" />
-                일정 중 게스트 예약 있음
-              </span>
-            </div>
-
             <button
               type="button"
               onClick={() => {
@@ -330,10 +372,10 @@ export default function StaffLocationController({
                   }
                   className="w-full rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-bold text-slate-900"
                 >
-                  <option value="샤바나">샤바나 (내부)</option>
-                  <option value="거실">거실 (내부)</option>
-                  <option value="사장님방">사장님방 (내부)</option>
-                  <option value="외박">외박 (외부)</option>
+                  <option value="샤바나">⛺ 샤바나 (내부)</option>
+                  <option value="거실">🛋️ 거실 (내부)</option>
+                  <option value="사장님방">🏠 사장님방 (내부)</option>
+                  <option value="외박">🚫 숙박 안 함 (외박)</option>
                 </select>
               </div>
 
@@ -356,19 +398,47 @@ export default function StaffLocationController({
             <strong className="text-emerald-700">[+ 스태프 추가]</strong> 버튼을 눌러 스태프를 등록하세요.
           </div>
         ) : (
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 pt-4">
+          <div className="grid grid-cols-1 gap-5 pt-4">
             {staff.map((member) => {
               const conflicts = getStaffConflicts(member);
               const hasConflict = conflicts.length > 0;
               const currentBedLabel = formatBedLabel(member.current_bed_id);
               const isUpdating = updatingStaffId === member.id;
               const isEditing = editingStaffId === member.id;
+              const selectedDates = selectedDatesByStaff[member.id] || [];
+              const customDatesCount = Object.keys(
+                member.daily_assignments || {}
+              ).length;
 
-              // Find first completely conflict-free bed for a 1-click smart recommendation
-              const recommendedBed = beds.find((b) => {
-                const st = getBedStatusForStaff(b, member);
+              // Calculate how many nights this staff is staying inside in the 14-day window
+              const stayingWindowCount = dateStrings.filter((dStr) => {
+                const a = getStaffAssignmentForDate(member, dStr);
+                return isStaffSleepingInside(a.location_note);
+              }).length;
+              const offWindowCount = dateStrings.length - stayingWindowCount;
+
+              // Find first conflict-free regular bed
+              const recommendedBed = regularBeds.find((b) => {
+                const st = getBedStatusForStaff(b, member, selectedDates);
                 return !st.hasConflictInWindow && !st.occupiedByOtherStaff;
               });
+
+              const applyLocationOrDateBatch = async (
+                bedId: number | null,
+                locationNote: StaffLocationNote
+              ) => {
+                if (selectedDates.length > 0) {
+                  await onChangeStaffDateLocation(
+                    member,
+                    selectedDates,
+                    bedId,
+                    locationNote
+                  );
+                  clearDateSelection(member.id);
+                } else {
+                  onChangeStaffLocation(member.id, bedId, locationNote);
+                }
+              };
 
               return (
                 <div
@@ -388,7 +458,7 @@ export default function StaffLocationController({
                       >
                         <div className="flex items-center justify-between">
                           <span className="text-xs font-extrabold text-indigo-900">
-                            ✏️ 스태프 이름 · 성별 · 상주 기간 설정
+                            ✏️ 스태프 이름 · 성별 · 기본 상주 기간 설정
                           </span>
                           <button
                             type="button"
@@ -452,7 +522,7 @@ export default function StaffLocationController({
                         <div className="grid grid-cols-2 gap-2 pt-1">
                           <div>
                             <label className="block text-[10px] font-bold text-slate-500 mb-0.5">
-                              근무 시작일
+                              기본 근무 시작일
                             </label>
                             <input
                               type="date"
@@ -463,7 +533,7 @@ export default function StaffLocationController({
                           </div>
                           <div>
                             <label className="block text-[10px] font-bold text-slate-500 mb-0.5">
-                              근무 종료일
+                              기본 근무 종료일
                             </label>
                             <input
                               type="date"
@@ -494,20 +564,22 @@ export default function StaffLocationController({
                               >
                                 {member.gender === 'M' ? '남' : '여'}
                               </span>
+                              <span className="px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-800 text-[11px] font-extrabold">
+                                14일 중 {stayingWindowCount}박 숙박 ·{' '}
+                                {offWindowCount}일 숙박안함
+                              </span>
                               <button
                                 type="button"
                                 onClick={() => startEditingStaff(member)}
                                 className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-white hover:bg-slate-100 text-slate-600 border border-slate-200 text-[11px] font-semibold transition-colors cursor-pointer"
-                                title="스태프 이름 및 성별 수정"
                               >
                                 <Pencil className="w-3 h-3" />
-                                이름/성별 설정
+                                이름/기간 설정
                               </button>
                               <button
                                 type="button"
                                 onClick={() => onDeleteStaff(member.id)}
                                 className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 text-[11px] font-semibold transition-colors cursor-pointer"
-                                title="스태프 삭제"
                               >
                                 <Trash2 className="w-3 h-3" />
                                 삭제
@@ -519,22 +591,21 @@ export default function StaffLocationController({
                               <div className="flex items-center gap-1.5 text-xs font-bold text-amber-800 mt-0.5">
                                 <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
                                 <span>
-                                  ⚠️ {currentBedLabel} 침대에 게스트 예약 중복 ({conflicts.length}박:{' '}
-                                  {conflicts[0].guestName} 외) — 위치를 변경해 주세요!
+                                  ⚠️ {conflicts[0].bedLabel} 침대에 게스트 예약 중복 (
+                                  {conflicts.length}박: {conflicts[0].guestName} 외) — 해당 날짜만 다른 위치/샤바나/숙박안함으로 바꾸거나 기본 침대를 변경해 주세요!
                                 </span>
                               </div>
                             ) : (
                               <div className="flex items-center gap-1 text-xs text-emerald-700 font-medium mt-0.5">
                                 <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
                                 <span>
-                                  현재 배정 위치 충돌 없음 (
-                                  {member.current_bed_id !== null
-                                    ? `${currentBedLabel} 침대 사용 중`
-                                    : `${member.location_note} (${
-                                        member.location_note === '외박'
-                                          ? '외부 취침'
-                                          : '내부 취침'
-                                      })`}
+                                  14일 일정 내 게스트 침대 충돌 없음 (기본값:{' '}
+                                  {member.current_bed_id !== null &&
+                                  member.location_note === '침대'
+                                    ? `${currentBedLabel} 침대`
+                                    : member.location_note === '외박'
+                                    ? '숙박 안 함 (외박)'
+                                    : member.location_note}
                                   )
                                 </span>
                               </div>
@@ -542,8 +613,8 @@ export default function StaffLocationController({
                           </div>
                         </div>
 
-                        {/* Current Location Badge & Quick Fix Button */}
-                        <div className="flex items-center gap-2">
+                        {/* Current Default Location Badge & Quick Fix Button */}
+                        <div className="flex items-center gap-2 flex-wrap">
                           {hasConflict && recommendedBed && (
                             <button
                               type="button"
@@ -561,11 +632,32 @@ export default function StaffLocationController({
                               빈 침대({formatBedCode(recommendedBed)})로 자동 이동
                             </button>
                           )}
+                          {customDatesCount > 0 && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                onChangeStaffDateLocation(
+                                  member,
+                                  Object.keys(member.daily_assignments || {}),
+                                  null,
+                                  null
+                                )
+                              }
+                              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-bold bg-white hover:bg-slate-100 text-slate-700 border border-slate-300 cursor-pointer"
+                              title="날짜별로 개별 지정한 내역을 모두 초기화하고 기본값으로 통일합니다"
+                            >
+                              <RotateCcw className="w-3 h-3" />
+                              개별 날짜 지정 초기화 ({customDatesCount}일)
+                            </button>
+                          )}
                           <div className="px-3 py-1 rounded-lg text-xs font-bold bg-white border border-slate-300 text-slate-800 shadow-2xs">
-                            현재:{' '}
+                            기본 배정:{' '}
                             <span className="text-indigo-700">
-                              {member.current_bed_id !== null
+                              {member.current_bed_id !== null &&
+                              member.location_note === '침대'
                                 ? `${currentBedLabel} (침대)`
+                                : member.location_note === '외박'
+                                ? '숙박 안 함 (외박)'
                                 : member.location_note}
                             </span>
                           </div>
@@ -574,16 +666,210 @@ export default function StaffLocationController({
                     )}
                   </div>
 
-                  {/* 1-Click Special Non-Bed Locations ('거실' | '사장님방' | '샤바나' | '외박') */}
+                  {/* 14-Day Per-Date Accommodation Schedule Strip */}
+                  <div className="mt-3 bg-white rounded-xl border border-slate-200 p-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                      <div className="flex items-center gap-1.5 text-xs font-extrabold text-slate-800">
+                        <Calendar className="w-3.5 h-3.5 text-emerald-600" />
+                        <span>
+                          📅 날짜별 숙박 지정 (14일 스케줄) — 각 날짜별로 드롭다운을 바꾸거나 날짜를 클릭해 선택 후 아래 버튼으로 일괄 지정하세요
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        {selectedDates.length > 0 ? (
+                          <>
+                            <span className="px-2 py-0.5 rounded-full bg-indigo-600 text-white text-[11px] font-extrabold">
+                              {selectedDates.length}개 날짜 선택됨 (아래 버튼 클릭 시 선택 날짜에만 적용)
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => clearDateSelection(member.id)}
+                              className="px-2 py-0.5 rounded bg-slate-100 hover:bg-slate-200 text-slate-700 text-[11px] font-bold cursor-pointer"
+                            >
+                              선택 해제
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setSelectedDatesByStaff((prev) => ({
+                                ...prev,
+                                [member.id]: [...dateStrings],
+                              }))
+                            }
+                            className="px-2 py-0.5 rounded bg-slate-100 hover:bg-slate-200 text-slate-700 text-[11px] font-bold cursor-pointer"
+                          >
+                            14일 전체 선택
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 sm:grid-cols-7 lg:grid-cols-14 gap-1.5">
+                      {dateStrings.map((dStr) => {
+                        const dObj = parseISO(dStr);
+                        const assign = getStaffAssignmentForDate(member, dStr);
+                        const isSelectedDate = selectedDates.includes(dStr);
+                        const isToday = dStr === todayStr;
+
+                        // Check conflict on this date
+                        const hasDateConflict =
+                          assign.location_note === '침대' &&
+                          assign.bed_id !== null &&
+                          reservations.some(
+                            (r) =>
+                              r.bed_id === assign.bed_id &&
+                              r.check_in <= dStr &&
+                              dStr < r.check_out
+                          );
+
+                        const selectValue =
+                          assign.location_note === '침대' &&
+                          assign.bed_id !== null
+                            ? `BED:${assign.bed_id}`
+                            : `LOC:${assign.location_note}`;
+
+                        return (
+                          <div
+                            key={dStr}
+                            className={`rounded-lg border p-1.5 flex flex-col justify-between gap-1 transition-all ${
+                              isSelectedDate
+                                ? 'border-indigo-600 bg-indigo-50/70 ring-2 ring-indigo-400'
+                                : hasDateConflict
+                                ? 'border-amber-400 bg-amber-50'
+                                : assign.location_note === '외박'
+                                ? 'border-slate-200 bg-slate-100/70 opacity-75'
+                                : assign.location_note === '샤바나'
+                                ? 'border-purple-300 bg-purple-50/60'
+                                : 'border-emerald-200 bg-emerald-50/40'
+                            }`}
+                          >
+                            <button
+                              type="button"
+                              onClick={() => toggleDateSelection(member.id, dStr)}
+                              className="flex items-center justify-between text-left w-full cursor-pointer"
+                              title="클릭하여 날짜 선택/해제"
+                            >
+                              <span
+                                className={`text-[10px] font-extrabold ${
+                                  isToday ? 'text-indigo-700' : 'text-slate-700'
+                                }`}
+                              >
+                                {format(dObj, 'M/d(EEE)', { locale: ko })}
+                              </span>
+                              {assign.isCustomDate && (
+                                <span
+                                  className="w-1.5 h-1.5 rounded-full bg-indigo-600"
+                                  title="개별 날짜 지정됨"
+                                />
+                              )}
+                            </button>
+
+                            <select
+                              value={selectValue}
+                              onChange={(e) => {
+                                const val = e.target.value;
+                                if (val.startsWith('BED:')) {
+                                  const bId = Number(val.replace('BED:', ''));
+                                  onChangeStaffDateLocation(
+                                    member,
+                                    [dStr],
+                                    bId,
+                                    '침대'
+                                  );
+                                } else {
+                                  const loc = val.replace(
+                                    'LOC:',
+                                    ''
+                                  ) as StaffLocationNote;
+                                  onChangeStaffDateLocation(
+                                    member,
+                                    [dStr],
+                                    loc === '샤바나' && shabanaBed
+                                      ? shabanaBed.id
+                                      : null,
+                                    loc
+                                  );
+                                }
+                              }}
+                              className={`w-full rounded border px-1 py-0.5 text-[10px] font-extrabold focus:outline-none cursor-pointer ${
+                                hasDateConflict
+                                  ? 'bg-amber-500 text-white border-amber-600'
+                                  : assign.location_note === '외박'
+                                  ? 'bg-slate-200 text-slate-700 border-slate-300'
+                                  : assign.location_note === '샤바나'
+                                  ? 'bg-purple-600 text-white border-purple-700'
+                                  : assign.location_note === '침대'
+                                  ? 'bg-emerald-600 text-white border-emerald-700'
+                                  : 'bg-indigo-600 text-white border-indigo-700'
+                              }`}
+                            >
+                              <option
+                                value="LOC:외박"
+                                className="bg-white text-rose-700 font-bold"
+                              >
+                                🚫 숙박안함
+                              </option>
+                              <option
+                                value="LOC:샤바나"
+                                className="bg-white text-purple-800 font-bold"
+                              >
+                                ⛺ 샤바나
+                              </option>
+                              <option
+                                value="LOC:거실"
+                                className="bg-white text-slate-900 font-bold"
+                              >
+                                🛋️ 거실
+                              </option>
+                              <option
+                                value="LOC:사장님방"
+                                className="bg-white text-slate-900 font-bold"
+                              >
+                                🏠 사장님방
+                              </option>
+                              <optgroup
+                                label="객실 침대"
+                                className="bg-white text-slate-900"
+                              >
+                                {regularBeds.map((b) => (
+                                  <option
+                                    key={b.id}
+                                    value={`BED:${b.id}`}
+                                    className="bg-white text-slate-900 font-bold"
+                                  >
+                                    🛏️ {formatBedCode(b)}
+                                  </option>
+                                ))}
+                              </optgroup>
+                            </select>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* 1-Click Special Non-Bed Locations ('샤바나' | '거실' | '사장님방' | '외박') */}
                   <div className="mt-3">
                     <div className="text-[11px] font-semibold text-slate-500 mb-1.5 flex items-center gap-1">
                       <Home className="w-3 h-3" />
-                      침대 외 상태로 1-Click 전환 (거실 · 사장님방 · 샤바나: 내부 취침 / 외박: 인원 제외):
+                      {selectedDates.length > 0 ? (
+                        <span className="text-indigo-700 font-extrabold">
+                          📌 선택한 {selectedDates.length}개 날짜를 아래 위치로 일괄 지정:
+                        </span>
+                      ) : (
+                        <span>
+                          기본 취침 위치를 침대 외 상태로 1-Click 전환 (샤바나 · 거실 · 사장님방: 숙박 포함 / 숙박 안 함: 인원 제외):
+                        </span>
+                      )}
                     </div>
                     <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                       {NON_BED_LOCATIONS.map((loc) => {
                         const isSelected =
-                          member.current_bed_id === null &&
+                          selectedDates.length === 0 &&
+                          (member.current_bed_id === null ||
+                            loc.note === '샤바나') &&
                           member.location_note === loc.note;
 
                         return (
@@ -592,11 +878,20 @@ export default function StaffLocationController({
                             type="button"
                             disabled={isUpdating}
                             onClick={() =>
-                              onChangeStaffLocation(member.id, null, loc.note)
+                              applyLocationOrDateBatch(
+                                loc.note === '샤바나' && shabanaBed
+                                  ? shabanaBed.id
+                                  : null,
+                                loc.note
+                              )
                             }
                             className={`flex flex-col items-center justify-center py-2 px-2 rounded-lg border text-xs transition-all cursor-pointer ${
                               isSelected
-                                ? 'bg-indigo-600 text-white border-indigo-600 font-bold shadow-xs'
+                                ? loc.note === '외박'
+                                  ? 'bg-slate-800 text-white border-slate-800 font-bold shadow-xs'
+                                  : loc.note === '샤바나'
+                                  ? 'bg-purple-600 text-white border-purple-600 font-bold shadow-xs'
+                                  : 'bg-indigo-600 text-white border-indigo-600 font-bold shadow-xs'
                                 : 'bg-white hover:bg-slate-100 text-slate-700 border-slate-200 font-semibold'
                             }`}
                           >
@@ -606,7 +901,7 @@ export default function StaffLocationController({
                             </div>
                             <span
                               className={`text-[10px] mt-0.5 ${
-                                isSelected ? 'text-indigo-100' : 'text-slate-400'
+                                isSelected ? 'text-white/80' : 'text-slate-400'
                               }`}
                             >
                               {loc.desc}
@@ -617,17 +912,26 @@ export default function StaffLocationController({
                     </div>
                   </div>
 
-                  {/* 1-Click Bed Switcher (All 12 Beds) */}
+                  {/* 1-Click Bed Switcher (All 12 Regular Beds) */}
                   <div className="mt-3">
                     <div className="text-[11px] font-semibold text-slate-500 mb-1.5 flex items-center gap-1">
                       <BedIcon className="w-3 h-3" />
-                      객실 침대로 1-Click 배정 (총 12베드):
+                      {selectedDates.length > 0 ? (
+                        <span className="text-indigo-700 font-extrabold">
+                          📌 선택한 {selectedDates.length}개 날짜를 특정 객실 침대로 일괄 배정:
+                        </span>
+                      ) : (
+                        <span>객실 침대로 기본 위치 1-Click 배정 (총 12베드):</span>
+                      )}
                     </div>
-                    <div className="grid grid-cols-4 sm:grid-cols-6 gap-1.5">
-                      {beds.map((bed) => {
-                        const isCurrentBed = member.current_bed_id === bed.id;
+                    <div className="grid grid-cols-4 sm:grid-cols-6 lg:grid-cols-12 gap-1.5">
+                      {regularBeds.map((bed) => {
+                        const isCurrentBed =
+                          selectedDates.length === 0 &&
+                          member.current_bed_id === bed.id &&
+                          member.location_note === '침대';
                         const { occupiedByOtherStaff, hasConflictInWindow } =
-                          getBedStatusForStaff(bed, member);
+                          getBedStatusForStaff(bed, member, selectedDates);
 
                         let btnStyle =
                           'bg-white hover:bg-emerald-50 text-slate-700 border-emerald-200';
@@ -659,12 +963,12 @@ export default function StaffLocationController({
                             type="button"
                             disabled={isUpdating}
                             onClick={() =>
-                              onChangeStaffLocation(member.id, bed.id, '침대')
+                              applyLocationOrDateBatch(bed.id, '침대')
                             }
                             title={
                               hasConflictInWindow
-                                ? `${formatBedCode(bed)} (${bed.room_name}): 표시된 14일 중 게스트 예약이 있습니다`
-                                : `${formatBedCode(bed)} (${bed.room_name}): 14일 내내 비어있음`
+                                ? `${formatBedCode(bed)} (${bed.room_name}): 일정 중 게스트 예약이 있습니다`
+                                : `${formatBedCode(bed)} (${bed.room_name}): 비어있음`
                             }
                             className={`px-2 py-1.5 rounded-lg border text-xs flex items-center justify-center gap-1 transition-all cursor-pointer ${btnStyle}`}
                           >
